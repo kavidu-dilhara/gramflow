@@ -1,0 +1,78 @@
+[tool.poetry]
+name = "gramflow"
+version = "1.0.0"
+description = "Upload files to Telegram up to 4 GiB, from the Terminal"
+authors = ["Kavidu Dilhara <kavidu-dilhara@users.noreply.github.com>"]
+homepage = "https://github.com/kavidu-dilhara/gramflow"
+repository = "https://github.com/kavidu-dilhara/gramflow"
+keywords = ["telegram-upload", "telegram", "upload", "video", "audio", "photo"]
+license = "AGPLv3"
+readme = "README.md"
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Software Development",
+]
+
+[tool.poetry.dependencies]
+# NOTE: kurigram is a drop-in replacement for pyrogram/pyrotgfork and is
+# still imported as `pyrogram` in code - it is actively maintained,
+# unlike the old pyrotgfork/pyrogram dependency this project used before.
+# https://github.com/KurimuzonAkuma/kurigram
+python = ">=3.9,<4"
+python-dotenv = "^1.2.3"
+kurigram = "^2.2.25"
+TgCrypto = "^1.2.5"
+hachoir = "^3.3.0"
+tqdm = "^4.70.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3"
+isort = "^5.13"
+black = "^24.10"
+autopep8 = "^2.3"
+autoflake = "^2.3"
+
+[tool.isort]
+profile = "black"
+include_trailing_comma = true
+lines_after_imports = 2
+lines_between_types = 1
+use_parentheses = true
+filter_files = true
+
+[tool.black]
+line-length = 79
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+gramflow = "gramflow.shell:main"
