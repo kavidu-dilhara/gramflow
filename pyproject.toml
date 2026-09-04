@@ -31,7 +31,7 @@ classifiers = [
 # still imported as `pyrogram` in code - it is actively maintained,
 # unlike the old pyrotgfork/pyrogram dependency this project used before.
 # https://github.com/KurimuzonAkuma/kurigram
-python = ">=3.9,<4"
+python = ">=3.10,<4"
 python-dotenv = "^1.2.3"
 kurigram = "^2.2.25"
 TgCrypto = "^1.2.5"
