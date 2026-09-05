@@ -129,9 +129,15 @@ async def moin(
 def main():
     import asyncio
     import argparse
+    from . import __version__
     parser = argparse.ArgumentParser(
         prog="GramFlow",
         description="Upload to Telegram, from the Terminal."
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "chat_id",
@@ -200,3 +206,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
