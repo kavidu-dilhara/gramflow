@@ -1,0 +1,16 @@
+# Telegram session & credentials
+*.session
+*.session-journal
+config.ini
+config.env
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Poetry / tooling
+.venv/
+.pytest_cache/
