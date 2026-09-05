@@ -86,14 +86,34 @@ async def upload_dir_contents(
             )
 
         elif os.stat(current_name).st_size <= tg_max_file_size:
-            response_message = await upload_single_file(
-                current_name,
-                thumbnail_file,
-                force_document,
-                custom_caption,
-                bot_sent_message,
-                console_progress,
-            )
+            # BUG FIX: previously an exception from a single file's
+            # upload (a transient network error, a FloodWait beyond
+            # the client's sleep_threshold, a file Telegram rejects
+            # outright, ...) propagated all the way up and aborted the
+            # *entire* batch, including every file not yet processed.
+            # Catch per-file failures, report them, and keep going.
+            try:
+                response_message = await upload_single_file(
+                    current_name,
+                    thumbnail_file,
+                    force_document,
+                    custom_caption,
+                    bot_sent_message,
+                    console_progress,
+                )
+            except Exception as e:
+                print(f"[error] failed to upload {current_name}: {e!r}")
+                try:
+                    await bot_sent_message.reply_text(
+                        text=(
+                            f"failed to upload "
+                            f"<code>{os.path.basename(current_name)}</code> "
+                            f"- {e}"
+                        ),
+                    )
+                except Exception:  # noqa: BLE001 - best-effort notice
+                    pass
+                response_message = False
             if isinstance(response_message, Message) and delete_on_success:
                 os.remove(current_name)
             uploaded = True
@@ -409,3 +429,4 @@ async def upload_as_audio(
             f"Uploading {os.path.basename(file_path)} as <b>AUDIO</b>"
         ),
     )
+    
