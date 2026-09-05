@@ -68,6 +68,11 @@ def write_default_config():
     with open(CONFIG_FILE, "w") as f:
         f.write(f"GF_TG_APP_ID={app_id}\n")
         f.write(f"GF_TG_API_HASH={api_hash}\n\n")
+    # SECURITY FIX: config.env holds the Telegram api_hash in plaintext.
+    # It was previously written with the process's default umask, which
+    # can leave it world- or group-readable on shared/multi-user
+    # machines. Lock it down to owner read/write only (0600).
+    os.chmod(CONFIG_FILE, 0o600)
     return load_dotenv(CONFIG_FILE)
 
 
