@@ -14,6 +14,7 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
+import asyncio
 import os
 import re
 from time import time
@@ -92,6 +93,11 @@ async def upload_dir_contents(
             # outright, ...) propagated all the way up and aborted the
             # *entire* batch, including every file not yet processed.
             # Catch per-file failures, report them, and keep going.
+            # NOTE: asyncio.CancelledError (Ctrl+C mid-upload) is a
+            # BaseException, not an Exception, so it is deliberately
+            # NOT caught here - it's re-raised below so cancellation
+            # still stops the batch instead of being treated as a
+            # per-file upload failure.
             try:
                 response_message = await upload_single_file(
                     current_name,
@@ -101,6 +107,8 @@ async def upload_dir_contents(
                     bot_sent_message,
                     console_progress,
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 print(f"[error] failed to upload {current_name}: {e!r}")
                 try:
@@ -140,6 +148,12 @@ async def upload_dir_contents(
         # oversized file. We now only sleep after an actual upload
         # attempt - skip-notices and pure-directory recursion don't
         # need to wait.
+        #
+        # BUG FIX: this sleep is where Ctrl+C mid-batch used to raise
+        # an uncaught asyncio.CancelledError that printed a full
+        # traceback. It's now allowed to propagate cleanly up to
+        # `main()` in shell.py, which catches it at the top level and
+        # exits quietly instead.
         if uploaded:
             await sleep(10)
 
@@ -428,5 +442,4 @@ async def upload_as_audio(
             pbar,
             f"Uploading {os.path.basename(file_path)} as <b>AUDIO</b>"
         ),
-    )
-    
+        )
