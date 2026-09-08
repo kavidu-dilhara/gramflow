@@ -14,10 +14,20 @@
 #  along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
+import logging
 import os
 from typing import Union
 from .gramflow import GramFlow
 from .upload import upload_dir_contents
+
+# BUG FIX: kurigram logs every FloodWait auto-retry (e.g. from
+# "upload.SaveBigFilePart" during large uploads) at INFO level, which
+# floods the terminal with repeated "Waiting for 1 seconds before
+# continuing..." lines. This is expected/normal behaviour during big
+# uploads, not an actual error - raise pyrogram's own logger threshold
+# so only warnings/errors are shown, without touching root logging
+# (so real errors elsewhere are unaffected).
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 
 
 async def upload(
@@ -201,9 +211,20 @@ def main():
     # deprecated since Python 3.10 and emits a DeprecationWarning (and
     # is slated for removal), plus it doesn't reliably close the loop
     # afterwards. `asyncio.run()` is the modern, correct entry point.
-    asyncio.run(moin(args))
+    #
+    # BUG FIX: pressing Ctrl+C mid-upload used to print a long,
+    # confusing traceback (KeyboardInterrupt racing with an in-flight
+    # `asyncio.sleep(10)` inside upload_dir_contents, which surfaces as
+    # asyncio.CancelledError chained to the original KeyboardInterrupt).
+    # Both are the user's own cancellation, not a bug - catch them here
+    # at the single top-level entry point and exit quietly instead of
+    # letting the traceback spill out. client.stop() is still called
+    # normally on this path because it lives in `moin`'s `finally`.
+    try:
+        asyncio.run(moin(args))
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\nCancelled by user.")
 
 
 if __name__ == "__main__":
     main()
-        
