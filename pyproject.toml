@@ -1,12 +1,12 @@
 [tool.poetry]
 name = "gramflow"
-version = "1.0.0"
+version = "1.0.1"
 description = "Upload files to Telegram up to 4 GiB, from the Terminal"
 authors = ["Kavidu Dilhara <kavidu-dilhara@users.noreply.github.com>"]
 homepage = "https://github.com/kavidu-dilhara/gramflow"
 repository = "https://github.com/kavidu-dilhara/gramflow"
 keywords = ["telegram-upload", "telegram", "upload", "video", "audio", "photo"]
-license = "AGPLv3"
+license = "MIT"
 readme = "README.md"
 
 classifiers = [
