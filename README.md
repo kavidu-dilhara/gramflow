@@ -35,6 +35,13 @@ bug fixes along the way.
 - Sends images as real Telegram photos, videos as videos (with an
   auto-generated thumbnail), audio with proper metadata — everything else as
   a document
+- Groups consecutive photos/videos into Telegram albums (media groups)
+  instead of one message per file
+- Resumes an interrupted batch — re-running the same folder against the
+  same destination skips files already uploaded
+- Batch-wide progress in a single status message, alongside the existing
+  per-file progress bar
+- `gramflow login` / `gramflow logout` to manage the saved session explicitly
 - Optional delete-on-success, custom captions, custom thumbnails, and a live
   console progress bar
 - Skips oversized files with a clear notice instead of failing silently
@@ -63,6 +70,21 @@ runs.
 
 ## Usage
 
+### Authentication
+
+```sh
+gramflow login    # authenticate once and save the session
+gramflow logout   # revoke the session with Telegram and remove it locally
+```
+
+You don't need to run `login` explicitly — the first upload will prompt for
+phone number / code / 2FA password automatically if there's no saved
+session. `login`/`logout` exist as explicit, discoverable commands for
+managing that session on demand (e.g. switching accounts, or fully logging
+out of a shared machine).
+
+### Uploading
+
 ```sh
 gramflow <chat_id> <path> [options]
 ```
@@ -81,14 +103,25 @@ $ gramflow 7351948 /path/to/dir/or/file --delete_on_success --fd -t /path/to/cus
 | `--caption "text"`      | Caption applied to every uploaded file (default: no caption)       |
 | `--progress`            | Show a live progress bar in the terminal                          |
 | `--topic <id>`          | Forum topic id to upload into                                     |
+| `--no-resume`           | Don't skip previously uploaded files for this folder/destination  |
+| `--fresh`               | Clear saved resume progress for this folder/destination first     |
+| `--no-albums`           | Send every photo/video as its own message instead of grouping into albums |
 
-The boolean flags (`--delete_on_success`, `--fd`, `--progress`) are plain
-on/off switches — include the flag to enable it, omit it to disable it.
-`--delete_on_success True` does **not** work; just pass `--delete_on_success`
-on its own.
+The boolean flags (`--delete_on_success`, `--fd`, `--progress`, `--no-resume`,
+`--fresh`, `--no-albums`) are plain on/off switches — include the flag to
+enable it, omit it to disable it. `--delete_on_success True` does **not**
+work; just pass `--delete_on_success` on its own.
 
 By default, files are sent **without** a caption. To get the old
 file-name-as-caption behaviour back, pass `--caption "<filename>"` yourself.
+
+### Resuming an interrupted upload
+
+If a batch is interrupted (crash, Ctrl+C, lost connection), just run the
+exact same command again — files already confirmed uploaded (matched by
+path, size, and modified time) are skipped automatically, and the batch
+picks up where it left off. Pass `--fresh` if you want to force a full
+re-upload of that same folder/destination instead.
 
 ## Configuration
 
@@ -102,8 +135,8 @@ be prompted for interactively if missing):
 | `GF_TG_ST`         | `sleep_threshold` passed to the client                | `10`    |
 | `GF_TG_WS`         | Number of worker threads                              | `10`    |
 | `GF_TG_MCTS`       | Max concurrent transmissions                          | `4`     |
-| `GF_TG_MMC`        | Max message cache size                                | `0`     |
-| `GF_TG_MBUC`       | Max business-user-connection cache size               | `0`     |
+| `GF_TG_MMC`        | Max message cache size                                | `10000` |
+| `GF_TG_MBUC`       | Max business-user-connection cache size               | `200`   |
 
 ## Security note
 
@@ -124,6 +157,13 @@ Telegram's own Terms of Service for user accounts, so keep usage reasonable
 - **Asked for `api_id`/`api_hash` every run** — check that
   `~/.config/gramflow/config.env` is writable and isn't being wiped by
   another process (e.g. a container that resets `$HOME` on restart).
+- **Asked to log in again unexpectedly** — the session file lives at
+  `~/.config/gramflow/GramFlow.session`. If it's missing or was deleted,
+  the next upload (or `gramflow login`) will re-prompt for authentication.
+- **A file re-uploads even though it succeeded before** — resume matching
+  is based on path, size, and modified time; if any of those changed (e.g.
+  the file was re-saved or moved), it's treated as a new file. Use
+  `--fresh` to intentionally clear resume history for a folder.
 
 ## Contributing
 
@@ -132,7 +172,7 @@ Issues and pull requests are welcome at
 
 ## License
 
-AGPL-3.0 — see [LICENSE](LICENSE). GramFlow is a fork of `uploadgram`;
+MIT [LICENSE](LICENSE). GramFlow is a fork of `uploadgram`;
 original copyright is preserved in file headers alongside the new
 copyright for this fork.
 
