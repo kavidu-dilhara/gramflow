@@ -22,10 +22,12 @@ from asyncio import sleep
 from tqdm import tqdm
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
-from pyrogram.types import Message
+from pyrogram.types import Message, InputMediaPhoto, InputMediaVideo
+from pyrogram.errors import RPCError
 from .config import TG_AUDIO_TYPES, TG_IMAGE_TYPES, TG_VIDEO_TYPES
 from .progress import progress_for_pyrogram
 from .take_screen_shot import take_screen_shot
+from .state import UploadState, BatchProgress
 
 
 def _natural_sort_key(value: str):
@@ -42,6 +44,51 @@ def _natural_sort_key(value: str):
 
 _DOTFILE_RE = re.compile(r"^\.")
 
+# Telegram allows at most 10 items in a single media group (album).
+MEDIA_GROUP_MAX = 10
+
+
+def _count_files_and_bytes(dir_path: str, tg_max_file_size: int):
+    """ Walk the tree up-front (read-only, no uploads) purely to size
+    the batch for BatchProgress. Mirrors the same dotfile-skip and
+    size-limit rules as upload_dir_contents so the totals it reports
+    match what will actually be attempted.
+    """
+    total_files = 0
+    total_bytes = 0
+    if not os.path.isdir(dir_path):
+        if os.path.exists(dir_path):
+            return 1, os.stat(dir_path).st_size
+        return 0, 0
+    for root, dirs, files in os.walk(dir_path):
+        dirs[:] = [d for d in dirs if not _DOTFILE_RE.match(d)]
+        for name in files:
+            if _DOTFILE_RE.match(name):
+                continue
+            full = os.path.join(root, name)
+            try:
+                size = os.stat(full).st_size
+            except OSError:
+                continue
+            if size <= tg_max_file_size:
+                total_files += 1
+                total_bytes += size
+    return total_files, total_bytes
+
+
+def _is_album_eligible(file_path: str, force_document: bool) -> str:
+    """ Returns 'photo', 'video', or '' (not album-eligible). Audio and
+    generic documents are never grouped into Telegram media groups the
+    way photos/videos are (media groups are strictly photo/video). """
+    if force_document:
+        return ""
+    upper_name = file_path.upper()
+    if upper_name.endswith(TG_IMAGE_TYPES):
+        return "photo"
+    if upper_name.endswith(TG_VIDEO_TYPES):
+        return "video"
+    return ""
+
 
 async def upload_dir_contents(
     tg_max_file_size: int,
@@ -52,6 +99,9 @@ async def upload_dir_contents(
     custom_caption: str,
     bot_sent_message: Message,
     console_progress: bool,
+    upload_state: UploadState = None,
+    batch_progress: BatchProgress = None,
+    use_albums: bool = True,
 ):
     dir_contents = []
     if not os.path.isdir(dir_path):
@@ -70,11 +120,144 @@ async def upload_dir_contents(
         name for name in dir_contents if not _DOTFILE_RE.match(name)
     ]
     dir_contents.sort(key=_natural_sort_key)
+
+    # Batch same-type (photo/photo or video/video) *consecutive* files
+    # into groups of up to MEDIA_GROUP_MAX for a single media-group
+    # send, instead of one Telegram message per file. Only consecutive
+    # runs are grouped so the destination chat keeps the same overall
+    # ordering as before; a document or a differently-typed file
+    # always flushes the pending group first.
+    pending_group: list = []
+    pending_group_kind = None
+
+    async def flush_group():
+        nonlocal pending_group, pending_group_kind
+        if not pending_group:
+            return
+        group = pending_group
+        pending_group = []
+        pending_group_kind = None
+        if len(group) == 1:
+            # A "group" of one file is just a normal single upload -
+            # no reason to use send_media_group for it.
+            await _upload_one(group[0])
+            return
+        await _upload_group(group)
+
+    async def _mark_result(file_path: str, size: int, ok: bool):
+        if ok:
+            if upload_state is not None:
+                upload_state.mark_done(file_path)
+            if batch_progress is not None:
+                batch_progress.file_done(size)
+            if delete_on_success:
+                try:
+                    os.remove(file_path)
+                except OSError as e:
+                    print(f"[warn] could not delete {file_path}: {e!r}")
+        else:
+            if upload_state is not None:
+                upload_state.mark_failed(file_path)
+            if batch_progress is not None:
+                batch_progress.file_failed()
+        await _maybe_update_batch_status()
+
+    _last_status_update = {"t": 0.0}
+
+    async def _maybe_update_batch_status():
+        # BUG-SAFE / NOTE: this status message is entirely separate
+        # from the existing per-file progress bar/message, and is
+        # rate-limited to roughly once every 5 seconds (or on the very
+        # first/last update) so it never adds meaningful extra
+        # Telegram API traffic or affects upload throughput.
+        if batch_progress is None:
+            return
+        now = time()
+        is_last = batch_progress.processed_files >= batch_progress.total_files
+        if not is_last and (now - _last_status_update["t"]) < 5:
+            return
+        _last_status_update["t"] = now
+        try:
+            await bot_sent_message.edit_text(batch_progress.summary_line())
+        except RPCError:
+            pass
+        except Exception:  # noqa: BLE001 - status update is best-effort
+            pass
+
+    async def _upload_one(file_path: str):
+        size = os.stat(file_path).st_size if os.path.exists(file_path) else 0
+        try:
+            response_message = await upload_single_file(
+                file_path,
+                thumbnail_file,
+                force_document,
+                custom_caption,
+                bot_sent_message,
+                console_progress,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[error] failed to upload {file_path}: {e!r}")
+            try:
+                await bot_sent_message.reply_text(
+                    text=(
+                        f"failed to upload "
+                        f"<code>{os.path.basename(file_path)}</code> "
+                        f"- {e}"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - best-effort notice
+                pass
+            response_message = False
+        await _mark_result(file_path, size, isinstance(response_message, Message))
+        await sleep(10)
+
+    async def _upload_group(file_paths: list):
+        media = []
+        sizes = {}
+        for i, fp in enumerate(file_paths):
+            sizes[fp] = os.stat(fp).st_size if os.path.exists(fp) else 0
+            # Only the first item in a media group carries the caption;
+            # Telegram/pyrogram apply it to the group as a whole.
+            cap = custom_caption if (custom_caption is not None and i == 0) else ""
+            kind = _is_album_eligible(fp, force_document)
+            if kind == "photo":
+                media.append(InputMediaPhoto(fp, caption=cap))
+            else:
+                media.append(InputMediaVideo(fp, caption=cap))
+        try:
+            sent = await bot_sent_message.reply_media_group(media=media)
+            # NOTE: Telegram media groups are sent as a single atomic
+            # call - pyrogram/kurigram gives no per-item success/failure
+            # signal, only success-or-exception for the whole group. If
+            # we got here without an exception, every file in the group
+            # is considered uploaded.
+            for fp in file_paths:
+                await _mark_result(fp, sizes[fp], bool(sent))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # BUG-SAFE: if the grouped send fails as a whole (a single
+            # bad/corrupt file in the group can make Telegram reject
+            # the entire album), fall back to uploading each file in
+            # the group individually rather than losing all of them.
+            print(
+                f"[warn] media group upload failed ({e!r}), "
+                f"falling back to individual uploads for this group"
+            )
+            for fp in file_paths:
+                await _upload_one(fp)
+            return
+        await sleep(10)
+
     for dir_cntn in dir_contents:
         current_name = os.path.join(dir_path, dir_cntn)
-        uploaded = False
 
         if os.path.isdir(current_name):
+            # A subdirectory boundary always flushes any pending
+            # group first, so albums never straddle directories.
+            await flush_group()
             await upload_dir_contents(
                 tg_max_file_size,
                 current_name,
@@ -84,49 +267,17 @@ async def upload_dir_contents(
                 custom_caption,
                 bot_sent_message,
                 console_progress,
+                upload_state=upload_state,
+                batch_progress=batch_progress,
+                use_albums=use_albums,
             )
+            continue
 
-        elif os.stat(current_name).st_size <= tg_max_file_size:
-            # BUG FIX: previously an exception from a single file's
-            # upload (a transient network error, a FloodWait beyond
-            # the client's sleep_threshold, a file Telegram rejects
-            # outright, ...) propagated all the way up and aborted the
-            # *entire* batch, including every file not yet processed.
-            # Catch per-file failures, report them, and keep going.
-            # NOTE: asyncio.CancelledError (Ctrl+C mid-upload) is a
-            # BaseException, not an Exception, so it is deliberately
-            # NOT caught here - it's re-raised below so cancellation
-            # still stops the batch instead of being treated as a
-            # per-file upload failure.
-            try:
-                response_message = await upload_single_file(
-                    current_name,
-                    thumbnail_file,
-                    force_document,
-                    custom_caption,
-                    bot_sent_message,
-                    console_progress,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                print(f"[error] failed to upload {current_name}: {e!r}")
-                try:
-                    await bot_sent_message.reply_text(
-                        text=(
-                            f"failed to upload "
-                            f"<code>{os.path.basename(current_name)}</code> "
-                            f"- {e}"
-                        ),
-                    )
-                except Exception:  # noqa: BLE001 - best-effort notice
-                    pass
-                response_message = False
-            if isinstance(response_message, Message) and delete_on_success:
-                os.remove(current_name)
-            uploaded = True
+        if not os.path.exists(current_name):
+            continue
 
-        else:
+        if os.stat(current_name).st_size > tg_max_file_size:
+            await flush_group()
             # BUG FIX: previously an oversized file was skipped with
             # zero feedback, which looked like the upload "silently
             # missed" some files. Now we say so, both in the console
@@ -137,25 +288,43 @@ async def upload_dir_contents(
             )
             print(f"[skip] {current_name} is larger than the allowed limit")
             try:
-                await bot_sent_message.reply_text(
-                    text=skip_notice,
-                )
+                await bot_sent_message.reply_text(text=skip_notice)
             except Exception:  # noqa: BLE001 - purely a best-effort notice
                 pass
+            if batch_progress is not None:
+                batch_progress.file_failed()
+            continue
 
-        # BUG FIX: previously the 10-second rate-limit pause ran after
-        # *every* iteration, including when we just skipped an
-        # oversized file. We now only sleep after an actual upload
-        # attempt - skip-notices and pure-directory recursion don't
-        # need to wait.
-        #
-        # BUG FIX: this sleep is where Ctrl+C mid-batch used to raise
-        # an uncaught asyncio.CancelledError that printed a full
-        # traceback. It's now allowed to propagate cleanly up to
-        # `main()` in shell.py, which catches it at the top level and
-        # exits quietly instead.
-        if uploaded:
-            await sleep(10)
+        # RESUME: skip files already recorded as uploaded in a
+        # previous run of this exact (directory, destination) job.
+        # This never affects files being uploaded for the first time
+        # or upload speed/ordering - it only prevents re-sending a
+        # file whose path+size+mtime exactly match a completed record.
+        if upload_state is not None and upload_state.is_done(current_name):
+            if batch_progress is not None:
+                batch_progress.file_skipped(os.stat(current_name).st_size)
+                await _maybe_update_batch_status()
+            continue
+
+        kind = _is_album_eligible(current_name, force_document) if use_albums else ""
+
+        if kind and kind == pending_group_kind:
+            pending_group.append(current_name)
+            if len(pending_group) >= MEDIA_GROUP_MAX:
+                await flush_group()
+            continue
+
+        # Either not album-eligible, or a different kind than the
+        # pending group - flush whatever was pending first.
+        await flush_group()
+
+        if kind:
+            pending_group = [current_name]
+            pending_group_kind = kind
+        else:
+            await _upload_one(current_name)
+
+    await flush_group()
 
 
 async def upload_single_file(
@@ -442,4 +611,5 @@ async def upload_as_audio(
             pbar,
             f"Uploading {os.path.basename(file_path)} as <b>AUDIO</b>"
         ),
-        )
+    )
+    
