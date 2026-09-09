@@ -5,6 +5,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: write
+
 jobs:
   pypi_release:
     name: Builds Using Poetry and Publishes to PyPI
@@ -25,4 +28,15 @@ jobs:
       - run: poetry config pypi-token.pypi "${{ secrets.PYPI_TOKEN }}"
       - name: Publish package
         run: poetry publish --build
-        
+      - name: Upload build artifacts to GitHub Release
+        # Only runs when this workflow was triggered by an actual
+        # GitHub release being published - `workflow_dispatch` runs
+        # have no release to attach files to, so this step is skipped
+        # (not failed) on that trigger.
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          # `poetry publish --build` leaves the built .tar.gz and .whl
+          # in dist/ - globbing here means this never needs a manual
+          # edit when the version number changes.
+          files: dist/*
