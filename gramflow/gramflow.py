@@ -21,7 +21,7 @@ import inspect
 # https://github.com/KurimuzonAkuma/kurigram
 from pyrogram import Client, __version__
 from pyrogram.enums import ParseMode, ClientPlatform
-from .config import write_default_config
+from .config import write_default_config, BASE_DIR
 from .get_config import get_config
 
 
@@ -37,6 +37,16 @@ class GramFlow(Client):
         write_default_config()
         wanted_kwargs = dict(
             name="GramFlow",
+            # BUG FIX: `workdir` was never passed, so pyrogram/kurigram
+            # defaulted to writing "GramFlow.session" into whatever
+            # directory the CLI happened to be *run from* - not
+            # ~/.config/gramflow/ where SESSION_FILE/BASE_DIR already
+            # assumed it would live. In practice this meant running
+            # gramflow from a different folder created a brand new,
+            # separate (logged-out) session every time, and there was
+            # no single reliable place for `gramflow logout` to find
+            # and delete the session file.
+            workdir=BASE_DIR,
             api_id=int(get_config("GF_TG_APP_ID")),
             api_hash=get_config("GF_TG_API_HASH"),
             parse_mode=ParseMode.HTML,
@@ -50,9 +60,16 @@ class GramFlow(Client):
             lang_pack="",
             lang_code="en",
             system_lang_code="en",
-            max_message_cache_size=int(get_config("GF_TG_MMC", 0)),
+            # BUG FIX: these previously defaulted to 0, which disables
+            # pyrogram/kurigram's message cache entirely. GramFlow's
+            # whole upload flow is built on `usr_sent_message.reply_*()`
+            # calls, which rely on that cache to resolve the parent
+            # message without an extra round trip - a size of 0 can
+            # cause intermittent reply failures under load. Restored to
+            # pyrogram's own sane defaults; still overridable via env.
+            max_message_cache_size=int(get_config("GF_TG_MMC", 10000)),
             max_business_user_connection_cache_size=int(
-                get_config("GF_TG_MBUC", 0)
+                get_config("GF_TG_MBUC", 200)
             ),
             client_platform=ClientPlatform.ANDROID,
         )
