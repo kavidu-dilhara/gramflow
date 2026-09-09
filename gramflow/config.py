@@ -22,7 +22,12 @@ from .get_config import get_config
 BASE_DIR = os.path.expanduser("~/.config/gramflow/")
 OLD_CONFIG_FILE = os.path.join(BASE_DIR, "config.ini")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.env")
-SESSION_FILE = os.path.join(BASE_DIR, "default")
+# BUG FIX: pyrogram/kurigram names session files "<name>.session", not
+# just "<name>" - this constant previously pointed at a file that
+# never actually existed, which would have made any code relying on
+# it (e.g. checking "is there a session?" or deleting it on logout)
+# silently no-op.
+SESSION_FILE = os.path.join(BASE_DIR, "GramFlow.session")
 TG_VIDEO_TYPES = (
     "M4V", "MP4", "MOV", "FLV", "WMV", "3GP", "MPEG", "MKV", "WEBM"
 )
@@ -42,6 +47,16 @@ TG_IMAGE_TYPES = (
 def write_default_config():
     """ write the default config.env file (or load an existing one)
     """
+    # BUG FIX: the env-var short-circuit below used to run *before*
+    # the legacy config.ini cleanup, so a user who had GF_TG_APP_ID /
+    # GF_TG_API_HASH already set as real environment variables (while
+    # also having a leftover config.ini from the old uploadgram days)
+    # would return immediately and the old config.ini was never
+    # touched - it just sat there unused forever. The one-time
+    # migration cleanup now always runs first, regardless of which
+    # path returns afterwards.
+    if os.path.exists(OLD_CONFIG_FILE) and not os.path.lexists(CONFIG_FILE):
+        os.remove(OLD_CONFIG_FILE)
     # If both credentials are already in the environment, there is
     # nothing to migrate and nothing to prompt for - just load any
     # existing config.env and return.
@@ -49,12 +64,6 @@ def write_default_config():
         return load_dotenv(CONFIG_FILE)
     if os.path.lexists(CONFIG_FILE):
         return load_dotenv(CONFIG_FILE)
-    # One-time migration: only remove the legacy config.ini when we
-    # are actually creating the new config.env for the first time.
-    # Previously this deletion ran on *every* import of gramflow.config,
-    # which silently destroyed any config.ini the user might have had.
-    if os.path.exists(OLD_CONFIG_FILE):
-        os.remove(OLD_CONFIG_FILE)
     os.makedirs(BASE_DIR, exist_ok=True)
     print(
         "Go to https://my.telegram.org (or @useTGxBot) "
