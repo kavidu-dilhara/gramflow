@@ -18,7 +18,9 @@ import logging
 import os
 from typing import Union
 from .gramflow import GramFlow
-from .upload import upload_dir_contents
+from .upload import upload_dir_contents, _count_files_and_bytes
+from .state import UploadState, BatchProgress
+from .config import SESSION_FILE
 
 # BUG FIX: kurigram logs every FloodWait auto-retry (e.g. from
 # "upload.SaveBigFilePart" during large uploads) at INFO level, which
@@ -40,6 +42,9 @@ async def upload(
     custom_caption: str = None,
     console_progress: bool = False,
     message_thread_id: int = None,
+    use_resume: bool = True,
+    fresh: bool = False,
+    use_albums: bool = True,
 ):
     # sent a message to verify write permission in the "to"
     status_message = await client.send_message(
@@ -51,18 +56,61 @@ async def upload(
     # get the max tg file_size that is allowed for this account
     tg_max_file_size = 4194304000 if client.me.is_premium else 2097152000
 
-    await upload_dir_contents(
-        tg_max_file_size,
-        files,
-        delete_on_success,
-        thumbnail_file,
-        force_document,
-        custom_caption,
-        status_message,
-        console_progress
+    upload_state = UploadState(files, to) if use_resume else None
+    if upload_state is not None and fresh:
+        upload_state.clear()
+
+    # RESUME/PROGRESS: size the whole batch up-front (read-only) so
+    # BatchProgress can report "X/Y files, N/M GB" from the very first
+    # status update, instead of only discovering totals as it goes.
+    # This is a plain os.walk with no network calls, so it does not
+    # affect upload throughput.
+    total_files, total_bytes = _count_files_and_bytes(files, tg_max_file_size)
+    batch_progress = BatchProgress(total_files, total_bytes)
+
+    if use_resume and upload_state is not None:
+        resumed_note = (
+            " (resuming - previously uploaded files in this folder "
+            "will be skipped)"
+        )
+    else:
+        resumed_note = ""
+    print(
+        f"[GramFlow] Starting batch: {total_files} file(s), "
+        f"{total_bytes} bytes{resumed_note}"
     )
 
-    await status_message.delete()
+    try:
+        await upload_dir_contents(
+            tg_max_file_size,
+            files,
+            delete_on_success,
+            thumbnail_file,
+            force_document,
+            custom_caption,
+            status_message,
+            console_progress,
+            upload_state=upload_state,
+            batch_progress=batch_progress,
+            use_albums=use_albums,
+        )
+    finally:
+        # Whole batch finished (or was interrupted) - if nothing is
+        # left unresolved, there is no reason to keep the per-job
+        # resume-state file around forever.
+        if upload_state is not None and not upload_state.has_unresolved_failures():
+            upload_state.discard_file()
+
+    print(
+        f"[GramFlow] Batch finished: {batch_progress.done_files} uploaded, "
+        f"{batch_progress.skipped_files} skipped, "
+        f"{batch_progress.failed_files} failed"
+    )
+
+    try:
+        await status_message.delete()
+    except Exception:  # noqa: BLE001 - best-effort cleanup of the status msg
+        pass
 
 
 def _parse_chat_id(dest_chat: str) -> Union[str, int]:
@@ -85,11 +133,22 @@ def _parse_chat_id(dest_chat: str) -> Union[str, int]:
         return dest_chat
 
 
-async def moin(
-    args
-):
+async def do_upload(args):
     client = GramFlow()
-    await client.start()
+    try:
+        await client.start()
+    except Exception as e:
+        # ERROR HANDLING: a failed start() (bad credentials, network
+        # down, corrupted session, revoked auth, ...) previously
+        # propagated as a raw traceback. Give a clear, actionable
+        # message instead, and point at `gramflow login` /
+        # `gramflow logout` as the fix.
+        print(f"[error] could not connect to Telegram: {e!r}")
+        print(
+            "If this persists, try `gramflow logout` followed by "
+            "`gramflow login` to re-authenticate."
+        )
+        return
 
     try:
         # BUG FIX: chat_id and dir_path are declared as required
@@ -104,15 +163,20 @@ async def moin(
         # a TypeError. Resolve the chat so usernames get translated to
         # the real numeric id (and write permission is implicitly
         # verified by get_me on start).
-        dest_chat = (
-            await client.get_chat(dest_chat)
-        ).id
+        try:
+            dest_chat = (await client.get_chat(dest_chat)).id
+        except Exception as e:
+            print(f"[error] could not resolve destination chat: {e!r}")
+            print(
+                "Check that the chat id/username is correct and that "
+                "this account can send messages there."
+            )
+            return
 
         dir_path = args.dir_path
         if not os.path.exists(dir_path):
-            raise FileNotFoundError(
-                f"path does not exist: {dir_path}"
-            )
+            print(f"[error] path does not exist: {dir_path}")
+            return
         dir_path = os.path.abspath(dir_path)
 
         await upload(
@@ -124,7 +188,10 @@ async def moin(
             force_document=args.fd,
             custom_caption=args.caption,
             console_progress=args.progress,
-            message_thread_id=args.topic
+            message_thread_id=args.topic,
+            use_resume=not args.no_resume,
+            fresh=args.fresh,
+            use_albums=not args.no_albums,
         )
     finally:
         # BUG FIX: previously `client.stop()` was only reached if
@@ -133,16 +200,113 @@ async def moin(
         # running/locked, so the *next* run would fail to start with
         # a "database is locked" style error until the process was
         # killed. Now the session is always stopped.
+        try:
+            await client.stop()
+        except Exception:  # noqa: BLE001 - already shutting down
+            pass
+
+
+async def do_login():
+    """ `gramflow login` - authenticate once and store the session.
+    pyrogram/kurigram already prompt for phone number / login code /
+    2FA password interactively the first time a Client with no
+    existing session calls start() - this subcommand just gives that
+    flow an explicit, discoverable name instead of it only happening
+    as a side effect of the first real upload.
+    """
+    if os.path.exists(SESSION_FILE):
+        print(
+            "A session already exists. Run `gramflow logout` first if "
+            "you want to log in as a different account."
+        )
+        return
+    client = GramFlow()
+    try:
+        await client.start()
+    except Exception as e:
+        print(f"[error] login failed: {e!r}")
+        return
+    try:
+        print(f"Logged in as {client.me.first_name} (id: {client.me.id}).")
+    finally:
         await client.stop()
+
+
+async def do_logout():
+    """ `gramflow logout` - revoke the session with Telegram and
+    remove the local session file, so a stale/unwanted session can
+    never be reused by mistake.
+    """
+    if not os.path.exists(SESSION_FILE):
+        print("Not logged in - nothing to do.")
+        return
+    client = GramFlow()
+    revoked = False
+    try:
+        await client.start()
+        # BUG-SAFE: log_out() tells Telegram's servers to invalidate
+        # this session (so it can no longer be used even if the local
+        # file were somehow copied elsewhere). If this fails (e.g. no
+        # network), we still remove the local file below so the CLI
+        # is at least locally logged out and `gramflow login` can
+        # create a fresh session.
+        await client.log_out()
+        revoked = True
+    except Exception as e:
+        print(f"[warn] could not reach Telegram to revoke the session: {e!r}")
+    finally:
+        # log_out() already deletes pyrogram's own session file on
+        # success; guard against it not existing any more before we
+        # try to remove it ourselves, and never let a missing file be
+        # reported as an error.
+        for path in (SESSION_FILE, f"{SESSION_FILE}-journal"):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as e:
+                print(f"[warn] could not remove {path}: {e!r}")
+    if revoked:
+        print("Logged out and revoked the session.")
+    else:
+        print("Removed the local session. (Could not confirm server-side revocation.)")
 
 
 def main():
     import asyncio
     import argparse
+    import sys
     from . import __version__
+
+    # BUG-SAFE: argparse subparsers are themselves a positional
+    # argument, so adding a `login`/`logout` subparser *and* keeping
+    # chat_id/dir_path as plain (optional) positionals on the same
+    # parser causes argparse to try to match the subparser choices
+    # against the first token - breaking the existing
+    # `gramflow <chat_id> <dir_path>` invocation entirely (a numeric
+    # chat_id would be rejected as "not a valid command"). Dispatch on
+    # the first token manually instead, before argparse ever sees it,
+    # so `login`/`logout` and the original upload invocation can
+    # coexist without changing the existing command-line shape.
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("login", "logout") and "--help" not in argv and "-h" not in argv:
+        if argv[0] == "login":
+            try:
+                asyncio.run(do_login())
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                print("\nCancelled by user.")
+        else:
+            try:
+                asyncio.run(do_logout())
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                print("\nCancelled by user.")
+        return
+
     parser = argparse.ArgumentParser(
         prog="GramFlow",
-        description="Upload to Telegram, from the Terminal."
+        description=(
+            "Upload to Telegram, from the Terminal. "
+            "Also supports `gramflow login` / `gramflow logout`."
+        )
     )
     parser.add_argument(
         "--version",
@@ -159,14 +323,14 @@ def main():
         type=str,
         help="enter path to upload to Telegram",
     )
-    # BUG FIX: these three flags used to be declared with
-    # `nargs="?", type=bool`. argparse's `type=bool` does NOT parse
-    # "true"/"false" strings - it just calls `bool(x)`, so *any*
-    # non-empty string (including the literal text "false") evaluates
-    # to True, and passing the bare flag with no value invoked
-    # `bool()` with no args -> False, the opposite of what a bare
-    # `--fd` should mean. `action="store_true"` is the correct,
-    # unambiguous way to express an on/off CLI flag.
+    # BUG FIX: these flags used to be declared with `nargs="?",
+    # type=bool`. argparse's `type=bool` does NOT parse "true"/"false"
+    # strings - it just calls `bool(x)`, so *any* non-empty string
+    # (including the literal text "false") evaluates to True, and
+    # passing the bare flag with no value invoked `bool()` with no
+    # args -> False, the opposite of what a bare `--fd` should mean.
+    # `action="store_true"` is the correct, unambiguous way to express
+    # an on/off CLI flag.
     parser.add_argument(
         "--delete_on_success",
         action="store_true",
@@ -206,7 +370,32 @@ def main():
         default=None,
         required=False
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help=(
+            "do not skip files uploaded in a previous run of this same "
+            "folder/destination - upload everything from scratch"
+        ),
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "clear any saved resume progress for this folder/destination "
+            "before starting"
+        ),
+    )
+    parser.add_argument(
+        "--no-albums",
+        action="store_true",
+        help=(
+            "disable grouping consecutive photos/videos into Telegram "
+            "media groups (albums) - send every file as its own message"
+        ),
+    )
     args = parser.parse_args()
+
     # BUG FIX: `asyncio.get_event_loop()` outside of a running loop is
     # deprecated since Python 3.10 and emits a DeprecationWarning (and
     # is slated for removal), plus it doesn't reliably close the loop
@@ -219,9 +408,9 @@ def main():
     # Both are the user's own cancellation, not a bug - catch them here
     # at the single top-level entry point and exit quietly instead of
     # letting the traceback spill out. client.stop() is still called
-    # normally on this path because it lives in `moin`'s `finally`.
+    # normally on this path because it lives in `do_upload`'s `finally`.
     try:
-        asyncio.run(moin(args))
+        asyncio.run(do_upload(args))
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nCancelled by user.")
 
