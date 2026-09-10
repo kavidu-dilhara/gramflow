@@ -15,6 +15,7 @@
 
 
 import os
+import shutil
 import uuid
 from time import time
 from .config import (
@@ -22,12 +23,38 @@ from .config import (
 )
 from .run_shell_command import run_command
 
+# BUG FIX: previously every single video in a batch silently tried
+# (and, if ffmpeg was missing, failed) to spawn ffmpeg before falling
+# back to no thumbnail - the failure reason itself was discarded (see
+# below), so a missing-ffmpeg batch just produced N unexplained
+# thumbnail-less videos with no indication why. Check availability
+# once, cache it for the process lifetime, and print one clear
+# message up front instead of failing N times silently.
+_ffmpeg_checked = False
+_ffmpeg_available = False
+
+
+def _check_ffmpeg_once() -> bool:
+    global _ffmpeg_checked, _ffmpeg_available
+    if not _ffmpeg_checked:
+        _ffmpeg_checked = True
+        _ffmpeg_available = shutil.which("ffmpeg") is not None
+        if not _ffmpeg_available:
+            print(
+                "[warn] ffmpeg not found on PATH - video thumbnails will "
+                "be skipped for this run. Install ffmpeg to enable them "
+                "(e.g. `apt install ffmpeg` / `brew install ffmpeg`)."
+            )
+    return _ffmpeg_available
+
 
 async def take_screen_shot(
     video_file: str,
     output_directory: str,
     ttl: int
 ):
+    if not _check_ffmpeg_once():
+        return None
     # https://stackoverflow.com/a/13891070/4723940
     # BUG FIX: was `str(time()) + ".jpg"`, which produced identical
     # filenames when two videos were processed within the same second
@@ -49,13 +76,21 @@ async def take_screen_shot(
             out_put_file_name
         ]
         # width = "90"
-        # BUG FIX: the ffmpeg result was previously discarded
-        # entirely, so a missing `ffmpeg` binary or a failed
-        # screenshot (bad seek time, corrupt video, etc.) would
-        # silently fall through to the `os.path.lexists` check below
-        # with no indication of *why* it failed. Now we at least know
-        # the command genuinely ran.
-        await run_command(file_genertor_command)
+        # BUG FIX: the ffmpeg result (returncode/stderr) was
+        # previously discarded entirely, so a failed screenshot (bad
+        # seek time, corrupt video, unsupported codec, disk full,
+        # ...) gave zero indication of *why* it failed - only that
+        # the output file didn't show up afterwards. Now the actual
+        # failure reason is surfaced.
+        _pid, returncode, _stdout, stderr = await run_command(
+            file_genertor_command
+        )
+        if returncode != 0 and not os.path.lexists(out_put_file_name):
+            print(
+                f"[warn] ffmpeg could not generate a thumbnail for "
+                f"{os.path.basename(video_file)}: "
+                f"{stderr.strip().splitlines()[-1] if stderr.strip() else 'unknown error'}"
+            )
     if os.path.lexists(out_put_file_name):
         return out_put_file_name
     else:
