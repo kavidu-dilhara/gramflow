@@ -515,12 +515,35 @@ async def upload_as_video(
         # subprocess (and a stray temp .jpg) for no reason - only
         # generate one if we actually need it.
         if not thumbnail_file:
-            thumb_nail_img = await take_screen_shot(
-                file_path,
-                os.path.dirname(os.path.abspath(file_path)),
-                (duration / 2),
-            )
-    except AssertionError:
+            try:
+                thumb_nail_img = await take_screen_shot(
+                    file_path,
+                    os.path.dirname(os.path.abspath(file_path)),
+                    (duration / 2),
+                )
+            except Exception as e:
+                # BUG FIX: previously any failure inside
+                # take_screen_shot (missing ffmpeg, a corrupt/odd
+                # video the ffmpeg build can't read, no disk space
+                # for the temp .jpg, etc.) was not handled here at
+                # all, so thumb_nail_img silently stayed None and the
+                # video upload later crashed trying to build a
+                # thumbnail out of nothing (see the guard below). A
+                # missing thumbnail should never block the actual
+                # video upload - Telegram accepts a video with no
+                # thumbnail just fine.
+                print(
+                    f"[warn] could not generate a thumbnail for "
+                    f"{file_path} ({e!r}), uploading without one"
+                )
+                thumb_nail_img = None
+    # BUG FIX: hachoir can fail in more ways than a bare
+    # AssertionError (e.g. an unreadable/truncated/exotic container
+    # raises other exception types too) - a failure at this stage
+    # should fall back to sending the file as a plain document, not
+    # crash the whole batch or, worse, leave duration/width/height at
+    # 0 while continuing as if metadata had been read successfully.
+    except Exception:
         return await upload_as_document(
             usr_sent_message,
             bot_sent_message,
@@ -530,20 +553,31 @@ async def upload_as_video(
             start_time,
             pbar,
         )
-    try:
-        metadata = extractMetadata(createParser(
-            thumbnail_file if thumbnail_file else thumb_nail_img
-        ))
-        if metadata and metadata.has("width"):
-            width = metadata.get("width")
-        if metadata and metadata.has("height"):
-            height = metadata.get("height")
-    except AssertionError:
-        pass
+
+    # BUG FIX: this is the actual crash reported - if no explicit
+    # --t thumbnail was given AND take_screen_shot failed/returned
+    # nothing, thumb_nail_img is None here. The old code unconditionally
+    # called `createParser(thumbnail_file if thumbnail_file else
+    # thumb_nail_img)`, i.e. `createParser(None)`, which hachoir does
+    # not handle cleanly (it can crash even in its own error-cleanup
+    # path). Only attempt to read thumbnail metadata if we actually
+    # have a thumbnail path.
+    thumb_path = thumbnail_file if thumbnail_file else thumb_nail_img
+    if thumb_path:
+        try:
+            metadata = extractMetadata(createParser(thumb_path))
+            if metadata and metadata.has("width"):
+                width = metadata.get("width")
+            if metadata and metadata.has("height"):
+                height = metadata.get("height")
+        except Exception:
+            # A bad thumbnail is not worth failing the video upload
+            # over - just send without width/height hints.
+            pass
     try:
         _tmp_m = await usr_sent_message.reply_video(
             video=file_path,
-            thumb=thumbnail_file if thumbnail_file else thumb_nail_img,
+            thumb=thumb_path,
             duration=duration,
             width=width,
             height=height,
