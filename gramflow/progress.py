@@ -2,16 +2,11 @@
 #  -*- coding: utf-8 -*-
 #  Copyright (C) 2021 The Original Uploadgram Authors
 #  Copyright (C) 2026 Kavidu Dilhara
-#  This program is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Affero General Public License as published by
-#  the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Affero General Public License for more details.
-#  You should have received a copy of the GNU Affero General Public License
-#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#  This program is licensed under the MIT License.
+#  You may use, copy, modify, merge, publish, distribute, sublicense,
+#  and/or sell copies of this software subject to the terms of the MIT License.
+#  The software is provided "AS IS", without warranty of any kind, express or
+#  implied. See the LICENSE file for the complete license text.
 
 """ progress helper """
 
@@ -90,9 +85,15 @@ async def progress_for_pyrogram(
         except ZeroDivisionError:
             percentage = 0
         elapsed_time = round(diff)
-        if elapsed_time == 0:
+        if elapsed_time == 0 and not is_final:
+            # BUG FIX: this used to return unconditionally, so a fast
+            # upload finishing in under a second never got its final
+            # 100% update and the status message stayed stuck on a
+            # stale in-progress percentage. Only skip mid-flight
+            # updates; the final one always goes through (speed/ETA
+            # gracefully show 0 in that case).
             return
-        speed = current / elapsed_time
+        speed = current / elapsed_time if elapsed_time > 0 else 0
         time_to_completion = round((total - current) / speed) if speed else 0
         estimated_total_time = elapsed_time + time_to_completion
 
@@ -117,6 +118,10 @@ async def progress_for_pyrogram(
             await message.edit_text(text=f"{ud_type}\n {tmp}")
         except FloodWait as e:
             await sleep(e.value)
+            try:
+                await message.edit_text(text=f"{ud_type}\n {tmp}")
+            except (FloodWait, MessageNotModified):
+                pass
         except MessageNotModified:
             # BUG FIX: the previous bare `except:` swallowed
             # everything, including Ctrl+C (KeyboardInterrupt) and

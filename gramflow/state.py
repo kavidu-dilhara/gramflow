@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 #  -*- coding: utf-8 -*-
 #  Copyright (C) 2026 Kavidu Dilhara
-#  This program is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Affero General Public License as published by
-#  the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Affero General Public License for more details.
-#  You should have received a copy of the GNU Affero General Public License
-#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#  This program is licensed under the MIT License.
+#  You may use, copy, modify, merge, publish, distribute, sublicense,
+#  and/or sell copies of this software subject to the terms of the MIT License.
+#  The software is provided "AS IS", without warranty of any kind, express or
+#  implied. See the LICENSE file for the complete license text.
 
 """
 Lightweight, dependency-free JSON state store for GramFlow.
@@ -111,7 +106,11 @@ class UploadState:
         try:
             with open(self.path, "r") as f:
                 data = json.load(f)
-            if not isinstance(data, dict) or "completed" not in data:
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("completed"), dict)
+                or not isinstance(data.get("failed", []), list)
+            ):
                 # Unexpected shape (e.g. from a future/older version)
                 # - treat as no usable state rather than crash.
                 return default
@@ -201,13 +200,18 @@ class UploadState:
             print(f"[warn] could not save resume state: {e!r}")
 
     def has_unresolved_failures(self) -> bool:
-        """ True if this job has files recorded as failed in a
-        previous or the current run. Used to decide whether the
-        on-disk resume state should be kept around after a batch
-        finishes (kept if there's something to retry, discarded if
-        the whole job completed cleanly).
+        """Return True only for failed files that still exist.
+
+        A user may delete a failed file between runs. Such a path is no
+        longer actionable and should not keep the resume-state file alive
+        forever.
         """
-        return bool(self._data.get("failed"))
+        failed = self._data.get("failed", [])
+        live_failed = [p for p in failed if os.path.exists(p)]
+        if live_failed != failed:
+            self._data["failed"] = live_failed
+            self._save()
+        return bool(live_failed)
 
     def clear(self):
         """ Wipe all resume records for this job (used by --fresh). """

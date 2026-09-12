@@ -2,16 +2,11 @@
 #  -*- coding: utf-8 -*-
 #  Copyright (C) 2021 The Original Uploadgram Authors
 #  Copyright (C) 2026 Kavidu Dilhara
-#  This program is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Affero General Public License as published by
-#  the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Affero General Public License for more details.
-#  You should have received a copy of the GNU Affero General Public License
-#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#  This program is licensed under the MIT License.
+#  You may use, copy, modify, merge, publish, distribute, sublicense,
+#  and/or sell copies of this software subject to the terms of the MIT License.
+#  The software is provided "AS IS", without warranty of any kind, express or
+#  implied. See the LICENSE file for the complete license text.
 
 
 import asyncio
@@ -27,7 +22,34 @@ from pyrogram.errors import RPCError
 from .config import TG_AUDIO_TYPES, TG_IMAGE_TYPES, TG_VIDEO_TYPES
 from .progress import progress_for_pyrogram
 from .take_screen_shot import take_screen_shot
+from .run_shell_command import run_command
 from .state import UploadState, BatchProgress
+
+
+async def _probe_video_duration(file_path: str):
+    """ Duration (seconds) via ffprobe, or None.
+
+    Hachoir (the pure-python parser used as the primary source) is
+    known to fail or stall on very large/multi-GB containers - which
+    is exactly the case where the caller would otherwise fall back to
+    ttl=0 and grab the (usually black) first frame. ffprobe is robust
+    on those same files and costs one quick metadata probe. Only runs
+    when the primary read failed, so the common path is untouched. """
+    try:
+        _pid, rc, stdout, _stderr = await run_command(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                file_path,
+            ],
+            timeout=60,
+        )
+        if rc == 0 and stdout:
+            return float(stdout.splitlines()[0].strip())
+    except (ValueError, OSError):
+        pass
+    return None
 
 
 def _natural_sort_key(value: str):
@@ -72,14 +94,29 @@ def _count_files_and_bytes(dir_path: str, tg_max_file_size: int):
         if os.path.exists(dir_path):
             return 1, os.stat(dir_path).st_size
         return 0, 0
-    for root, dirs, files in os.walk(dir_path):
-        dirs[:] = [d for d in dirs if not _DOTFILE_RE.match(d)]
+    for root, dirs, files in os.walk(dir_path, followlinks=False):
+        # Never descend into symlinked directories. They may point outside
+        # the requested tree or back to an ancestor and create recursion.
+        real_dirs = []
+        for name in dirs:
+            full = os.path.join(root, name)
+            if _DOTFILE_RE.match(name):
+                continue
+            if os.path.islink(full):
+                total_files += 1
+                try:
+                    total_bytes += os.lstat(full).st_size
+                except OSError:
+                    pass
+                continue
+            real_dirs.append(name)
+        dirs[:] = real_dirs
         for name in files:
             if _DOTFILE_RE.match(name):
                 continue
             full = os.path.join(root, name)
             try:
-                size = os.stat(full).st_size
+                size = os.lstat(full).st_size if os.path.islink(full) else os.stat(full).st_size
             except OSError:
                 continue
             total_files += 1
@@ -272,9 +309,26 @@ async def upload_dir_contents(
                     continue
                 thumb_for_this = thumbnail_file
                 if not thumb_for_this:
+                    # BUG FIX: this used to pass ttl=0, i.e. always
+                    # capture the FIRST frame of the video - which is
+                    # black for any video with a fade-in/intro, so
+                    # every video in an album got a black thumbnail.
+                    # Use the same duration/2 seek as single uploads.
+                    _dur = 0
+                    try:
+                        _md = extractMetadata(createParser(fp))
+                        if _md and _md.has("duration"):
+                            _dur = _md.get("duration").seconds
+                    except Exception:
+                        _dur = 0
+                    if not _dur:
+                        _probed = await _probe_video_duration(fp)
+                        if _probed:
+                            _dur = int(_probed)
                     try:
                         thumb_for_this = await take_screen_shot(
-                            fp, os.path.dirname(os.path.abspath(fp)), 0,
+                            fp, os.path.dirname(os.path.abspath(fp)),
+                            (_dur / 2),
                         )
                         if thumb_for_this:
                             generated_thumbs.append(thumb_for_this)
@@ -300,35 +354,20 @@ async def upload_dir_contents(
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                # BUG-SAFE: if the grouped send fails as a whole (a
-                # single bad/corrupt file in the group can make
-                # Telegram reject the entire album), fall back to
-                # uploading each file in the group individually rather
-                # than losing all of them.
-                #
-                # BUG FIX (item 6 - stacked fallback delays): the
-                # per-file rate-limit sleep now happens ONLY inside
-                # the shared `_rate_limit_pause()` helper, called
-                # exactly once per actually-attempted upload
-                # (individual or group). Previously, falling back to
-                # `_upload_one()` for every file in a failed group
-                # meant N individual 10-second sleeps stacked back to
-                # back (e.g. a failed 10-item album -> 100 seconds of
-                # pure waiting) with no equivalent single sleep having
-                # been "spent" on the group's own failed attempt. The
-                # fallback path below still respects one rate-limit
-                # pause per file it actually sends (Telegram is still
-                # being sent N individual messages, so N pauses across
-                # those sends is correct rate-limit behaviour) - what
-                # changed is that this is now one deliberate, documented
-                # mechanism instead of delays stacking by accident
-                # across two different code paths.
+                # IMPORTANT: do not automatically retry an album as
+                # individual messages after an ambiguous Telegram/network
+                # exception. The server may have accepted the album while
+                # the client failed to receive the response; retrying here
+                # can therefore duplicate every item in the group. Mark the
+                # whole group failed and let the normal resume mechanism
+                # retry it on a later explicit run.
                 print(
-                    f"[warn] media group upload failed ({e!r}), "
-                    f"falling back to individual uploads for this group"
+                    f"[error] media group upload failed ({e!r}); "
+                    "the group was not retried automatically to avoid duplicates"
                 )
                 for fp in file_paths:
-                    await _upload_one(fp)
+                    await _mark_result(fp, sizes[fp], False)
+                await _rate_limit_pause()
                 return
         finally:
             for path in generated_thumbs:
@@ -341,6 +380,19 @@ async def upload_dir_contents(
 
     for dir_cntn in dir_contents:
         current_name = os.path.join(dir_path, dir_cntn)
+
+        if os.path.islink(current_name):
+            print(f"[skip] symlink is not supported: {current_name}")
+            try:
+                size = os.lstat(current_name).st_size
+            except OSError:
+                size = 0
+            if batch_progress is not None:
+                batch_progress.file_failed()
+                await _maybe_update_batch_status()
+            if upload_state is not None:
+                upload_state.mark_failed(current_name)
+            continue
 
         if os.path.isdir(current_name):
             # A subdirectory boundary always flushes any pending
@@ -625,14 +677,34 @@ async def upload_as_video(
     # upload_as_document, via the try/finally around that call.
     try:
         metadata = extractMetadata(createParser(file_path))
-        if metadata and metadata.has("duration"):
-            duration = metadata.get("duration").seconds
+        if metadata:
+            # BUG FIX: width/height used to be read from the
+            # *thumbnail JPEG* instead of the video itself - a mismatched
+            # or oddly-encoded thumbnail could make Telegram stretch the
+            # video. Read dimensions from the video's own metadata (same
+            # single hachoir parse, zero extra cost); the thumbnail only
+            # needs to exist, its own metadata is irrelevant.
+            if metadata.has("duration"):
+                duration = metadata.get("duration").seconds
+            if metadata.has("width"):
+                width = metadata.get("width")
+            if metadata.has("height"):
+                height = metadata.get("height")
     except Exception as e:
         print(
             f"[warn] could not read metadata for "
             f"{os.path.basename(file_path)} ({e!r}); uploading as a "
             f"video anyway with default duration=0"
         )
+    if not duration:
+        # BUG FIX: hachoir commonly fails on very large videos, which
+        # used to leave duration=0 - and ttl=0 screenshots the first
+        # frame (black on most recordings). Fall back to ffprobe so
+        # the thumbnail seek still lands mid-video. One quick probe,
+        # only on the failure path.
+        _probed_duration = await _probe_video_duration(file_path)
+        if _probed_duration:
+            duration = int(_probed_duration)
 
     # BUG FIX: a screenshot used to be generated with ffmpeg on
     # *every* video upload, even when the caller already supplied
@@ -670,18 +742,9 @@ async def upload_as_video(
     # which hachoir does not handle cleanly (it can crash even in its
     # own error-cleanup path). Only attempt to read thumbnail metadata
     # if we actually have a thumbnail path.
+    # Width/height were already taken from the VIDEO metadata above;
+    # the thumbnail path alone is passed to Telegram here.
     thumb_path = thumbnail_file if thumbnail_file else thumb_nail_img
-    if thumb_path:
-        try:
-            metadata = extractMetadata(createParser(thumb_path))
-            if metadata and metadata.has("width"):
-                width = metadata.get("width")
-            if metadata and metadata.has("height"):
-                height = metadata.get("height")
-        except Exception:
-            # A bad thumbnail is not worth failing the video upload
-            # over - just send without width/height hints.
-            pass
     try:
         try:
             _tmp_m = await usr_sent_message.reply_video(
@@ -743,7 +806,20 @@ async def upload_as_audio(
     start_time: int,
     pbar: tqdm,
 ):
-    metadata = extractMetadata(createParser(file_path))
+    # BUG FIX: this parse used to be unguarded (unlike the video
+    # path), so a corrupt/odd audio file raised here and was marked
+    # "failed" instead of falling back to a document upload. Match
+    # the video behaviour: metadata failure logs a warning and
+    # proceeds with defaults.
+    try:
+        metadata = extractMetadata(createParser(file_path))
+    except Exception as e:
+        print(
+            f"[warn] could not read metadata for "
+            f"{os.path.basename(file_path)} ({e!r}); uploading as "
+            f"audio anyway with default tags"
+        )
+        metadata = None
     duration = 0
     title = None
     performer = None

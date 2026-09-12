@@ -2,16 +2,11 @@
 #  -*- coding: utf-8 -*-
 #  Copyright (C) 2021 The Original Uploadgram Authors
 #  Copyright (C) 2026 Kavidu Dilhara
-#  This program is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Affero General Public License as published by
-#  the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Affero General Public License for more details.
-#  You should have received a copy of the GNU Affero General Public License
-#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#  This program is licensed under the MIT License.
+#  You may use, copy, modify, merge, publish, distribute, sublicense,
+#  and/or sell copies of this software subject to the terms of the MIT License.
+#  The software is provided "AS IS", without warranty of any kind, express or
+#  implied. See the LICENSE file for the complete license text.
 
 
 import logging
@@ -137,22 +132,22 @@ def _parse_chat_id(dest_chat: str) -> Union[str, int]:
 
 async def do_upload(args):
     client = GramFlow()
+    started = False
     try:
-        await client.start()
-    except Exception as e:
-        # ERROR HANDLING: a failed start() (bad credentials, network
-        # down, corrupted session, revoked auth, ...) previously
-        # propagated as a raw traceback. Give a clear, actionable
-        # message instead, and point at `gramflow login` /
-        # `gramflow logout` as the fix.
-        print(f"[error] could not connect to Telegram: {e!r}")
-        print(
-            "If this persists, try `gramflow logout` followed by "
-            "`gramflow login` to re-authenticate."
-        )
-        return
+        try:
+            await client.start()
+            started = True
+        except Exception as e:
+            # A failed start can still partially initialize the client.
+            # Keep cleanup in one finally block so resources are released
+            # whenever the underlying library reports a partial startup.
+            print(f"[error] could not connect to Telegram: {e!r}")
+            print(
+                "If this persists, try `gramflow logout` followed by "
+                "`gramflow login` to re-authenticate."
+            )
+            return
 
-    try:
         # BUG FIX: chat_id and dir_path are declared as required
         # positional args in argparse, so the previous `if not
         # dest_chat: input(...)` / `while not os.path.exists(...)`
@@ -202,10 +197,11 @@ async def do_upload(args):
         # running/locked, so the *next* run would fail to start with
         # a "database is locked" style error until the process was
         # killed. Now the session is always stopped.
-        try:
-            await client.stop()
-        except Exception:  # noqa: BLE001 - already shutting down
-            pass
+        if started:
+            try:
+                await client.stop()
+            except Exception:  # noqa: BLE001 - already shutting down
+                pass
 
 
 async def do_login():

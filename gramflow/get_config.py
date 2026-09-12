@@ -2,16 +2,11 @@
 #  -*- coding: utf-8 -*-
 #  Copyright (C) 2021 The Original Uploadgram Authors
 #  Copyright (C) 2026 Kavidu Dilhara
-#  This program is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Affero General Public License as published by
-#  the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Affero General Public License for more details.
-#  You should have received a copy of the GNU Affero General Public License
-#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#  This program is licensed under the MIT License.
+#  You may use, copy, modify, merge, publish, distribute, sublicense,
+#  and/or sell copies of this software subject to the terms of the MIT License.
+#  The software is provided "AS IS", without warranty of any kind, express or
+#  implied. See the LICENSE file for the complete license text.
 
 """ wrapper for getting the credentials """
 

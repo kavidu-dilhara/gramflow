@@ -2,16 +2,11 @@
 #  -*- coding: utf-8 -*-
 #  Copyright (C) 2021 The Original Uploadgram Authors
 #  Copyright (C) 2026 Kavidu Dilhara
-#  This program is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Affero General Public License as published by
-#  the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Affero General Public License for more details.
-#  You should have received a copy of the GNU Affero General Public License
-#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#  This program is licensed under the MIT License.
+#  You may use, copy, modify, merge, publish, distribute, sublicense,
+#  and/or sell copies of this software subject to the terms of the MIT License.
+#  The software is provided "AS IS", without warranty of any kind, express or
+#  implied. See the LICENSE file for the complete license text.
 
 
 import os
@@ -58,6 +53,14 @@ def _secure_chmod(path: str):
         pass
 
 
+def _valid_credentials(app_id, api_hash):
+    try:
+        int(str(app_id).strip())
+    except (TypeError, ValueError):
+        return False
+    return bool(str(api_hash).strip())
+
+
 def write_default_config():
     """ write the default config.env file (or load an existing one)
     """
@@ -74,8 +77,14 @@ def write_default_config():
     # If both credentials are already in the environment, there is
     # nothing to migrate and nothing to prompt for - just load any
     # existing config.env and return.
-    if os.environ.get("GF_TG_APP_ID") and os.environ.get("GF_TG_API_HASH"):
-        return load_dotenv(CONFIG_FILE)
+    env_app_id = os.environ.get("GF_TG_APP_ID")
+    env_api_hash = os.environ.get("GF_TG_API_HASH")
+    if env_app_id or env_api_hash:
+        if _valid_credentials(env_app_id, env_api_hash):
+            return load_dotenv(CONFIG_FILE)
+        raise ValueError(
+            "GF_TG_APP_ID and GF_TG_API_HASH must contain valid Telegram API credentials"
+        )
     if os.path.lexists(CONFIG_FILE):
         # BUG FIX (item 7 - stale insecure permissions): previously
         # 0600 was only applied at the moment config.env was first
@@ -86,7 +95,16 @@ def write_default_config():
         # shared machine, forever. Re-assert 0600 on every run for an
         # existing file too, not just on creation.
         _secure_chmod(CONFIG_FILE)
-        return load_dotenv(CONFIG_FILE)
+        load_dotenv(CONFIG_FILE)
+        if _valid_credentials(
+            os.environ.get("GF_TG_APP_ID"), os.environ.get("GF_TG_API_HASH")
+        ):
+            return True
+        print("[warn] existing config.env is missing or invalid Telegram API credentials; recreating it")
+        try:
+            os.remove(CONFIG_FILE)
+        except OSError:
+            pass
     os.makedirs(BASE_DIR, exist_ok=True)
     print(
         "Go to https://my.telegram.org (or @useTGxBot) "
@@ -97,16 +115,18 @@ def write_default_config():
     # shown to the user ("enter app_id 's value: ").
     app_id = int(get_config("app_id", should_prompt=True))
     api_hash = get_config("api_hash", should_prompt=True)
-    with open(CONFIG_FILE, "w") as f:
+    # SECURITY FIX: config.env holds the Telegram api_hash in plaintext.
+    # Write it atomically (temp file -> chmod 0600 -> os.replace) so a
+    # crash mid-write can never leave a truncated config OR a window
+    # where the credentials file exists with default (possibly world-
+    # readable) permissions. os.replace is atomic on POSIX and Windows.
+    _tmp_config = CONFIG_FILE + ".tmp"
+    with open(_tmp_config, "w") as f:
         f.write(f"GF_TG_APP_ID={app_id}\n")
         f.write(f"GF_TG_API_HASH={api_hash}\n\n")
-    # SECURITY FIX: config.env holds the Telegram api_hash in plaintext.
-    # It was previously written with the process's default umask, which
-    # can leave it world- or group-readable on shared/multi-user
-    # machines. Lock it down to owner read/write only (0600). Uses the
-    # same best-effort helper as the "already exists" path above so
-    # platforms without chmod support can't crash the CLI here either.
-    _secure_chmod(CONFIG_FILE)
+    # chmod the temp file BEFORE it takes the real name.
+    _secure_chmod(_tmp_config)
+    os.replace(_tmp_config, CONFIG_FILE)
     return load_dotenv(CONFIG_FILE)
 
 

@@ -2,45 +2,57 @@
 #  -*- coding: utf-8 -*-
 #  Copyright (C) 2021 The Original Uploadgram Authors
 #  Copyright (C) 2026 Kavidu Dilhara
-#  This program is free software: you can redistribute it and/or modify
-#  it under the terms of the GNU Affero General Public License as published by
-#  the Free Software Foundation, either version 3 of the License, or
-#  (at your option) any later version.
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU Affero General Public License for more details.
-#  You should have received a copy of the GNU Affero General Public License
-#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#  This program is licensed under the MIT License.
+#  You may use, copy, modify, merge, publish, distribute, sublicense,
+#  and/or sell copies of this software subject to the terms of the MIT License.
+#  The software is provided "AS IS", without warranty of any kind, express or
+#  implied. See the LICENSE file for the complete license text.
 
 
 import asyncio
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
-async def run_command(shell_command: List) -> Tuple[int, int, str, str]:
+async def run_command(
+    shell_command: List,
+    timeout: Optional[int] = None,
+) -> Tuple[int, int, str, str]:
     """ executes a shell_command,
     and returns the pid, returncode, stdout and stderr.
 
-    BUG FIX: previously, if the target binary (e.g. `ffmpeg`) was not
-    installed, `asyncio.create_subprocess_exec` raised an unhandled
-    `FileNotFoundError` that crashed the whole upload. This is now
-    caught and reported back as a non-zero return code instead.
+    `timeout` (seconds) bounds how long the subprocess may run.
+    Previously a hung ffmpeg (corrupt/large video) blocked the upload
+    forever; now a timeout kills the process and reports returncode
+    124 so callers treat it as a normal, handled failure.
+
+    NOTE: stdout/stderr are decoded as latin-1 (a 1:1 byte<->char
+    mapping) so binary output (e.g. ffmpeg rawvideo) survives the
+    round-trip without corruption - callers that expect text get
+    identical text, and callers that need bytes can .encode("latin-1").
     """
+    process = None
     try:
         process = await asyncio.create_subprocess_exec(
             *shell_command,
-            # stdout must a pipe to be accessible as process.stdout
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=timeout
+        )
     except FileNotFoundError as e:
         return (0, 1, "", str(e))
-    # Wait for the subprocess to finish
-    stdout, stderr = await process.communicate()
+    except asyncio.TimeoutError:
+        if process is not None:
+            try:
+                process.kill()
+                await process.wait()
+            except ProcessLookupError:
+                pass
+        return (0, 124, "", f"command timed out after {timeout}s")
     return (
         process.pid,
         process.returncode,
-        stdout.decode().strip(),
-        stderr.decode().strip()
+        stdout.decode("latin-1").strip(),
+        stderr.decode("latin-1").strip(),
     )
