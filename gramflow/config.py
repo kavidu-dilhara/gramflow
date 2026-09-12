@@ -44,6 +44,20 @@ TG_IMAGE_TYPES = (
 )
 
 
+def _secure_chmod(path: str):
+    """ Best-effort lock-down of a credentials file to owner
+    read/write only (0600). Never raises - some platforms/filesystems
+    (notably Windows, and some network/FAT-style mounts) don't support
+    POSIX permission bits at all, and this must not crash the CLI on
+    those. """
+    try:
+        os.chmod(path, 0o600)
+    except (OSError, NotImplementedError):
+        # chmod unsupported or refused on this platform/filesystem -
+        # nothing more we can safely do here without breaking the CLI.
+        pass
+
+
 def write_default_config():
     """ write the default config.env file (or load an existing one)
     """
@@ -63,6 +77,15 @@ def write_default_config():
     if os.environ.get("GF_TG_APP_ID") and os.environ.get("GF_TG_API_HASH"):
         return load_dotenv(CONFIG_FILE)
     if os.path.lexists(CONFIG_FILE):
+        # BUG FIX (item 7 - stale insecure permissions): previously
+        # 0600 was only applied at the moment config.env was first
+        # created. A file that already existed - e.g. created by an
+        # older GramFlow version before this fix, restored from a
+        # backup, or copied in manually - kept whatever permissions it
+        # already had, potentially readable by other users on a
+        # shared machine, forever. Re-assert 0600 on every run for an
+        # existing file too, not just on creation.
+        _secure_chmod(CONFIG_FILE)
         return load_dotenv(CONFIG_FILE)
     os.makedirs(BASE_DIR, exist_ok=True)
     print(
@@ -80,8 +103,10 @@ def write_default_config():
     # SECURITY FIX: config.env holds the Telegram api_hash in plaintext.
     # It was previously written with the process's default umask, which
     # can leave it world- or group-readable on shared/multi-user
-    # machines. Lock it down to owner read/write only (0600).
-    os.chmod(CONFIG_FILE, 0o600)
+    # machines. Lock it down to owner read/write only (0600). Uses the
+    # same best-effort helper as the "already exists" path above so
+    # platforms without chmod support can't crash the CLI here either.
+    _secure_chmod(CONFIG_FILE)
     return load_dotenv(CONFIG_FILE)
 
 
