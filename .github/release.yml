@@ -1,0 +1,32 @@
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+
+  categories:
+    - title: "✨ New Features"
+      labels:
+        - feature
+        - enhancement
+
+    - title: "🐛 Bug Fixes"
+      labels:
+        - bug
+        - bug-fix
+
+    - title: "🔧 Improvements"
+      labels:
+        - improvement
+        - performance
+
+    - title: "📚 Documentation"
+      labels:
+        - documentation
+
+    - title: "📦 Dependencies"
+      labels:
+        - dependencies
+
+    - title: "🔄 Other Changes"
+      labels:
+        - "*"
