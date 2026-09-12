@@ -172,9 +172,9 @@ Issues and pull requests are welcome at
 
 ## License
 
-MIT [LICENSE](LICENSE). GramFlow is a fork of `uploadgram`;
-original copyright is preserved in file headers alongside the new
-copyright for this fork.
+ MIT License — see [LICENSE](LICENSE). GramFlow is a fork of
+`uploadgram`; original copyright is preserved in file headers alongside the
+new copyright for this fork.
 
 ## Author
 
