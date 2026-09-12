@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "gramflow"
-version = "1.0.1"
+version = "1.0.2"
 description = "Upload files to Telegram up to 4 GiB, from the Terminal"
 authors = ["Kavidu Dilhara <kavidu-dilhara@users.noreply.github.com>"]
 homepage = "https://github.com/kavidu-dilhara/gramflow"
@@ -14,10 +14,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Intended Audience :: Developers",
     "Natural Language :: English",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
