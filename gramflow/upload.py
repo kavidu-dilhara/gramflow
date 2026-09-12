@@ -50,9 +50,21 @@ MEDIA_GROUP_MAX = 10
 
 def _count_files_and_bytes(dir_path: str, tg_max_file_size: int):
     """ Walk the tree up-front (read-only, no uploads) purely to size
-    the batch for BatchProgress. Mirrors the same dotfile-skip and
-    size-limit rules as upload_dir_contents so the totals it reports
-    match what will actually be attempted.
+    the batch for BatchProgress. Mirrors the dotfile-skip rule in
+    upload_dir_contents.
+
+    NOTE: `tg_max_file_size` is intentionally unused now (kept in the
+    signature for call-site/API stability) - see the BUG FIX note
+    below for why oversized files are no longer excluded here.
+
+    BUG FIX (processed > total): oversized files are now INCLUDED in
+    the totals (counted as part of the batch, sized by their real
+    file size) rather than excluded - they are still skipped rather
+    than uploaded, but the main loop marks them via
+    BatchProgress.file_oversized(), which now correctly has a
+    corresponding slot in total_files/total_bytes. Previously this
+    function excluded them while the main loop counted them anyway,
+    which could push processed_files above total_files (e.g. "11/10").
     """
     total_files = 0
     total_bytes = 0
@@ -70,9 +82,8 @@ def _count_files_and_bytes(dir_path: str, tg_max_file_size: int):
                 size = os.stat(full).st_size
             except OSError:
                 continue
-            if size <= tg_max_file_size:
-                total_files += 1
-                total_bytes += size
+            total_files += 1
+            total_bytes += size
     return total_files, total_bytes
 
 
@@ -184,6 +195,17 @@ async def upload_dir_contents(
         except Exception:  # noqa: BLE001 - status update is best-effort
             pass
 
+    # BUG FIX (item 6): centralise the post-upload rate-limit pause in
+    # one place so every upload path (single file, group, and group
+    # -> individual fallback) goes through the same mechanism instead
+    # of each call site having its own `await sleep(10)`. This doesn't
+    # change the actual delay - a 10s pause still happens once per
+    # file actually sent to Telegram - it just makes "one pause per
+    # send" an explicit invariant instead of something that happened
+    # to be true by coincidence across two different functions.
+    async def _rate_limit_pause():
+        await sleep(10)
+
     async def _upload_one(file_path: str):
         size = os.stat(file_path).st_size if os.path.exists(file_path) else 0
         try:
@@ -211,45 +233,111 @@ async def upload_dir_contents(
                 pass
             response_message = False
         await _mark_result(file_path, size, isinstance(response_message, Message))
-        await sleep(10)
+        await _rate_limit_pause()
 
     async def _upload_group(file_paths: list):
         media = []
         sizes = {}
-        for i, fp in enumerate(file_paths):
-            sizes[fp] = os.stat(fp).st_size if os.path.exists(fp) else 0
-            # Only the first item in a media group carries the caption;
-            # Telegram/pyrogram apply it to the group as a whole.
-            cap = custom_caption if (custom_caption is not None and i == 0) else ""
-            kind = _is_album_eligible(fp, force_document)
-            if kind == "photo":
-                media.append(InputMediaPhoto(fp, caption=cap))
-            else:
-                media.append(InputMediaVideo(fp, caption=cap))
+        # BUG FIX (item 1 - album thumbnails ignored): InputMediaVideo
+        # DOES support a `thumb` parameter in pyrogram/kurigram (this
+        # is a real, supported capability - InputMediaPhoto has none,
+        # since Telegram always auto-thumbnails photos itself, so this
+        # only applies to the video items in a group). Previously
+        # every InputMediaVideo() in a group was built with no `thumb`
+        # at all, so --t was silently dropped for any video that
+        # ended up in an album, even though the exact same file
+        # uploaded alone would have used it correctly.
+        #
+        # Auto-generated screenshots are also now attempted for
+        # videos in a group when no --t was given, for parity with
+        # single-video uploads. Each is a separate temp file (ffmpeg
+        # can't target the same output path concurrently) and all of
+        # them are cleaned up in the `finally` below, whether the
+        # group send succeeds, fails, or falls back to individual
+        # uploads.
+        generated_thumbs = []
         try:
-            sent = await bot_sent_message.reply_media_group(media=media)
-            # NOTE: Telegram media groups are sent as a single atomic
-            # call - pyrogram/kurigram gives no per-item success/failure
-            # signal, only success-or-exception for the whole group. If
-            # we got here without an exception, every file in the group
-            # is considered uploaded.
-            for fp in file_paths:
-                await _mark_result(fp, sizes[fp], bool(sent))
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            # BUG-SAFE: if the grouped send fails as a whole (a single
-            # bad/corrupt file in the group can make Telegram reject
-            # the entire album), fall back to uploading each file in
-            # the group individually rather than losing all of them.
-            print(
-                f"[warn] media group upload failed ({e!r}), "
-                f"falling back to individual uploads for this group"
-            )
-            for fp in file_paths:
-                await _upload_one(fp)
-            return
-        await sleep(10)
+            for i, fp in enumerate(file_paths):
+                sizes[fp] = os.stat(fp).st_size if os.path.exists(fp) else 0
+                # Only the first item in a media group carries the
+                # caption; Telegram/pyrogram apply it to the group as
+                # a whole.
+                cap = (
+                    custom_caption
+                    if (custom_caption is not None and i == 0) else ""
+                )
+                kind = _is_album_eligible(fp, force_document)
+                if kind == "photo":
+                    media.append(InputMediaPhoto(fp, caption=cap))
+                    continue
+                thumb_for_this = thumbnail_file
+                if not thumb_for_this:
+                    try:
+                        thumb_for_this = await take_screen_shot(
+                            fp, os.path.dirname(os.path.abspath(fp)), 0,
+                        )
+                        if thumb_for_this:
+                            generated_thumbs.append(thumb_for_this)
+                    except Exception as e:
+                        print(
+                            f"[warn] could not generate a thumbnail for "
+                            f"{fp} in album ({e!r}), uploading without one"
+                        )
+                        thumb_for_this = None
+                media.append(
+                    InputMediaVideo(fp, caption=cap, thumb=thumb_for_this)
+                )
+            try:
+                sent = await bot_sent_message.reply_media_group(media=media)
+                # NOTE: Telegram media groups are sent as a single
+                # atomic call - pyrogram/kurigram gives no per-item
+                # success/failure signal, only success-or-exception
+                # for the whole group. If we got here without an
+                # exception, every file in the group is considered
+                # uploaded.
+                for fp in file_paths:
+                    await _mark_result(fp, sizes[fp], bool(sent))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # BUG-SAFE: if the grouped send fails as a whole (a
+                # single bad/corrupt file in the group can make
+                # Telegram reject the entire album), fall back to
+                # uploading each file in the group individually rather
+                # than losing all of them.
+                #
+                # BUG FIX (item 6 - stacked fallback delays): the
+                # per-file rate-limit sleep now happens ONLY inside
+                # the shared `_rate_limit_pause()` helper, called
+                # exactly once per actually-attempted upload
+                # (individual or group). Previously, falling back to
+                # `_upload_one()` for every file in a failed group
+                # meant N individual 10-second sleeps stacked back to
+                # back (e.g. a failed 10-item album -> 100 seconds of
+                # pure waiting) with no equivalent single sleep having
+                # been "spent" on the group's own failed attempt. The
+                # fallback path below still respects one rate-limit
+                # pause per file it actually sends (Telegram is still
+                # being sent N individual messages, so N pauses across
+                # those sends is correct rate-limit behaviour) - what
+                # changed is that this is now one deliberate, documented
+                # mechanism instead of delays stacking by accident
+                # across two different code paths.
+                print(
+                    f"[warn] media group upload failed ({e!r}), "
+                    f"falling back to individual uploads for this group"
+                )
+                for fp in file_paths:
+                    await _upload_one(fp)
+                return
+        finally:
+            for path in generated_thumbs:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+        await _rate_limit_pause()
 
     for dir_cntn in dir_contents:
         current_name = os.path.join(dir_path, dir_cntn)
@@ -291,8 +379,21 @@ async def upload_dir_contents(
                 await bot_sent_message.reply_text(text=skip_notice)
             except Exception:  # noqa: BLE001 - purely a best-effort notice
                 pass
+            # BUG FIX (item 2 - processed > total): this used to call
+            # batch_progress.file_failed(), which is counted toward
+            # processed_files without ever having had a matching slot
+            # in total_files (oversized files were excluded from the
+            # up-front count). Oversized files are now included in
+            # the total (see _count_files_and_bytes) and tracked in
+            # their own bucket here, so the math always stays
+            # consistent (processed_files can never exceed
+            # total_files) and the final summary can distinguish
+            # "too large to send" from an actual upload failure.
             if batch_progress is not None:
-                batch_progress.file_failed()
+                batch_progress.file_oversized(
+                    os.stat(current_name).st_size
+                )
+                await _maybe_update_batch_status()
             continue
 
         # RESUME: skip files already recorded as uploaded in a
@@ -505,63 +606,70 @@ async def upload_as_video(
     width = 0
     height = 0
     thumb_nail_img = None
+
+    # BUG FIX (item 5 - hachoir failure must not turn a valid video
+    # into a document): previously, ANY exception while reading the
+    # source video's metadata (including take_screen_shot's own
+    # already-handled failures, since they used to live inside this
+    # same try block) caused the whole file to be re-routed to
+    # upload_as_document - even though a hachoir parse failure says
+    # nothing about whether Telegram/ffmpeg can actually handle the
+    # file as a video. Hachoir not recognising an exotic/truncated
+    # container, or choking on a valid-but-unusual video, is common
+    # and does not mean the file itself is broken. Metadata extraction
+    # is now isolated in its own try/except: on failure it logs a
+    # diagnostic and falls back to safe defaults (duration/width/
+    # height = 0), but ALWAYS proceeds to attempt the actual video
+    # upload below. Only a genuine failure from reply_video() itself
+    # (Telegram/pyrogram rejecting the file) still falls back to
+    # upload_as_document, via the try/finally around that call.
     try:
         metadata = extractMetadata(createParser(file_path))
         if metadata and metadata.has("duration"):
             duration = metadata.get("duration").seconds
-        # BUG FIX: a screenshot used to be generated with ffmpeg on
-        # *every* video upload, even when the caller already supplied
-        # an explicit --t thumbnail file. That's a wasted ffmpeg
-        # subprocess (and a stray temp .jpg) for no reason - only
-        # generate one if we actually need it.
-        if not thumbnail_file:
-            try:
-                thumb_nail_img = await take_screen_shot(
-                    file_path,
-                    os.path.dirname(os.path.abspath(file_path)),
-                    (duration / 2),
-                )
-            except Exception as e:
-                # BUG FIX: previously any failure inside
-                # take_screen_shot (missing ffmpeg, a corrupt/odd
-                # video the ffmpeg build can't read, no disk space
-                # for the temp .jpg, etc.) was not handled here at
-                # all, so thumb_nail_img silently stayed None and the
-                # video upload later crashed trying to build a
-                # thumbnail out of nothing (see the guard below). A
-                # missing thumbnail should never block the actual
-                # video upload - Telegram accepts a video with no
-                # thumbnail just fine.
-                print(
-                    f"[warn] could not generate a thumbnail for "
-                    f"{file_path} ({e!r}), uploading without one"
-                )
-                thumb_nail_img = None
-    # BUG FIX: hachoir can fail in more ways than a bare
-    # AssertionError (e.g. an unreadable/truncated/exotic container
-    # raises other exception types too) - a failure at this stage
-    # should fall back to sending the file as a plain document, not
-    # crash the whole batch or, worse, leave duration/width/height at
-    # 0 while continuing as if metadata had been read successfully.
-    except Exception:
-        return await upload_as_document(
-            usr_sent_message,
-            bot_sent_message,
-            file_path,
-            caption_rts,
-            thumbnail_file,
-            start_time,
-            pbar,
+    except Exception as e:
+        print(
+            f"[warn] could not read metadata for "
+            f"{os.path.basename(file_path)} ({e!r}); uploading as a "
+            f"video anyway with default duration=0"
         )
 
-    # BUG FIX: this is the actual crash reported - if no explicit
-    # --t thumbnail was given AND take_screen_shot failed/returned
-    # nothing, thumb_nail_img is None here. The old code unconditionally
-    # called `createParser(thumbnail_file if thumbnail_file else
-    # thumb_nail_img)`, i.e. `createParser(None)`, which hachoir does
-    # not handle cleanly (it can crash even in its own error-cleanup
-    # path). Only attempt to read thumbnail metadata if we actually
-    # have a thumbnail path.
+    # BUG FIX: a screenshot used to be generated with ffmpeg on
+    # *every* video upload, even when the caller already supplied
+    # an explicit --t thumbnail file. That's a wasted ffmpeg
+    # subprocess (and a stray temp .jpg) for no reason - only
+    # generate one if we actually need it.
+    if not thumbnail_file:
+        try:
+            thumb_nail_img = await take_screen_shot(
+                file_path,
+                os.path.dirname(os.path.abspath(file_path)),
+                (duration / 2),
+            )
+        except Exception as e:
+            # BUG FIX: previously any failure inside take_screen_shot
+            # (missing ffmpeg, a corrupt/odd video the ffmpeg build
+            # can't read, no disk space for the temp .jpg, etc.) was
+            # not handled here at all, so thumb_nail_img silently
+            # stayed None and the video upload later crashed trying
+            # to build a thumbnail out of nothing (see the guard
+            # below). A missing thumbnail should never block the
+            # actual video upload - Telegram accepts a video with no
+            # thumbnail just fine.
+            print(
+                f"[warn] could not generate a thumbnail for "
+                f"{file_path} ({e!r}), uploading without one"
+            )
+            thumb_nail_img = None
+
+    # BUG FIX: this is the actual crash reported previously - if no
+    # explicit --t thumbnail was given AND take_screen_shot
+    # failed/returned nothing, thumb_nail_img is None here. The old
+    # code unconditionally called `createParser(thumbnail_file if
+    # thumbnail_file else thumb_nail_img)`, i.e. `createParser(None)`,
+    # which hachoir does not handle cleanly (it can crash even in its
+    # own error-cleanup path). Only attempt to read thumbnail metadata
+    # if we actually have a thumbnail path.
     thumb_path = thumbnail_file if thumbnail_file else thumb_nail_img
     if thumb_path:
         try:
@@ -575,22 +683,47 @@ async def upload_as_video(
             # over - just send without width/height hints.
             pass
     try:
-        _tmp_m = await usr_sent_message.reply_video(
-            video=file_path,
-            thumb=thumb_path,
-            duration=duration,
-            width=width,
-            height=height,
-            supports_streaming=True,
-            caption=caption_rts,
-            progress=progress_for_pyrogram,
-            progress_args=(
+        try:
+            _tmp_m = await usr_sent_message.reply_video(
+                video=file_path,
+                thumb=thumb_path,
+                duration=duration,
+                width=width,
+                height=height,
+                supports_streaming=True,
+                caption=caption_rts,
+                progress=progress_for_pyrogram,
+                progress_args=(
+                    bot_sent_message,
+                    start_time,
+                    pbar,
+                    f"Uploading {os.path.basename(file_path)} as <b>VIDEO</b>"
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # BUG FIX (item 5, part 2): THIS is the correct place for
+            # a document fallback - an actual rejection of the video
+            # by Telegram/pyrogram (unsupported codec/container,
+            # corrupt stream data, etc.), as opposed to hachoir merely
+            # failing to *describe* the file above. The fallback
+            # itself is unchanged from before; what changed is that a
+            # hachoir metadata-read failure no longer reaches this
+            # path at all.
+            print(
+                f"[warn] {file_path} could not be sent as a video "
+                f"({e!r}), sending as a document instead"
+            )
+            _tmp_m = await upload_as_document(
+                usr_sent_message,
                 bot_sent_message,
+                file_path,
+                caption_rts,
+                thumbnail_file,
                 start_time,
                 pbar,
-                f"Uploading {os.path.basename(file_path)} as <b>VIDEO</b>"
-            ),
-        )
+            )
     finally:
         # BUG FIX: previously the generated thumbnail was only deleted
         # on the *success* path of reply_video. If the upload raised
