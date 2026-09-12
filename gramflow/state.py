@@ -127,14 +127,59 @@ class UploadState:
 
     @staticmethod
     def _file_fingerprint(file_path: str) -> str:
+        # BUG FIX (resume fingerprint precision): previously used
+        # `int(stat.st_mtime)`, truncating to whole seconds. Two
+        # distinct modifications to the same file within the same
+        # second produced an identical fingerprint, so a file that
+        # was overwritten (bad upload, corrupted download, edited
+        # again) right after a previous successful upload could be
+        # wrongly treated as "already done" and silently skipped on
+        # resume. `st_mtime_ns` (nanosecond precision, available on
+        # all platforms Python's os.stat supports) makes two distinct
+        # writes reliably produce different fingerprints.
         try:
             stat = os.stat(file_path)
-            return f"{os.path.abspath(file_path)}|{stat.st_size}|{int(stat.st_mtime)}"
+            return (
+                f"{os.path.abspath(file_path)}|{stat.st_size}|"
+                f"{stat.st_mtime_ns}"
+            )
+        except OSError:
+            return os.path.abspath(file_path)
+
+    @staticmethod
+    def _legacy_file_fingerprint(file_path: str) -> str:
+        """ The pre-fix fingerprint format (integer-second mtime).
+        Used only to check old resume records during the one-time
+        migration in _load(), so upgrading GramFlow does not silently
+        forget every file a user already uploaded.
+        """
+        try:
+            stat = os.stat(file_path)
+            return (
+                f"{os.path.abspath(file_path)}|{stat.st_size}|"
+                f"{int(stat.st_mtime)}"
+            )
         except OSError:
             return os.path.abspath(file_path)
 
     def is_done(self, file_path: str) -> bool:
-        return self._file_fingerprint(file_path) in self._data["completed"]
+        if self._file_fingerprint(file_path) in self._data["completed"]:
+            return True
+        # MIGRATION: a record written by a pre-fix version of GramFlow
+        # will be keyed by the old (second-precision) fingerprint. If
+        # the file's *current* legacy-format fingerprint matches an
+        # old record, honour it as done, rather than re-uploading
+        # every previously-completed file after an upgrade. The record
+        # is then rewritten under the new, more precise key so future
+        # checks no longer need this fallback for this file.
+        legacy_key = self._legacy_file_fingerprint(file_path)
+        if legacy_key in self._data.get("completed", {}):
+            new_key = self._file_fingerprint(file_path)
+            self._data["completed"][new_key] = True
+            del self._data["completed"][legacy_key]
+            self._save()
+            return True
+        return False
 
     def mark_done(self, file_path: str):
         self._data["completed"][self._file_fingerprint(file_path)] = True
@@ -187,6 +232,16 @@ class BatchProgress:
     show overall progress ("12/47 uploaded, 2 failed, 1.2/4.8 GB")
     instead of only per-file progress. Purely additive - does not
     replace or alter the existing per-file progress callback.
+
+    BUG FIX (processed > total): oversized files used to be excluded
+    from `total_files`/`total_bytes` (computed up-front by a walk that
+    filters them out) but then counted via `file_failed()` once the
+    main loop actually reached them - inflating `processed_files`
+    past `total_files` (e.g. "11/10 files"). Oversized files are now
+    tracked in their own `oversized_files` bucket, included in
+    `total_files`/`total_bytes` from the start (matching the walk in
+    upload._count_files_and_bytes, which now includes them too), so
+    `processed_files` can never exceed `total_files`.
     """
 
     def __init__(self, total_files: int, total_bytes: int):
@@ -195,6 +250,7 @@ class BatchProgress:
         self.done_files = 0
         self.failed_files = 0
         self.skipped_files = 0
+        self.oversized_files = 0
         self.done_bytes = 0
         self.started_at = time.time()
 
@@ -209,9 +265,22 @@ class BatchProgress:
         self.skipped_files += 1
         self.done_bytes += size
 
+    def file_oversized(self, size: int):
+        """ File exceeds Telegram's max upload size for this account.
+        Counted toward `total_files`/`total_bytes` (it was included
+        there from the start) and toward `processed_files`, but kept
+        separate from `failed_files` since it isn't a failure of the
+        upload attempt - the file was never attempted.
+        """
+        self.oversized_files += 1
+        self.done_bytes += size
+
     @property
     def processed_files(self) -> int:
-        return self.done_files + self.failed_files + self.skipped_files
+        return (
+            self.done_files + self.failed_files
+            + self.skipped_files + self.oversized_files
+        )
 
     def summary_line(self) -> str:
         from .humanbytes import humanbytes
@@ -231,6 +300,8 @@ class BatchProgress:
         ]
         if self.skipped_files:
             parts.append(f"- {self.skipped_files} skipped (resumed)")
+        if self.oversized_files:
+            parts.append(f"- {self.oversized_files} skipped (too large)")
         if self.failed_files:
             parts.append(f"- {self.failed_files} failed")
         return " ".join(parts)
