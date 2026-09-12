@@ -18,4 +18,4 @@
 
 __author__ = """Kavidu Dilhara"""
 __email__ = "kavidu-dilhara@users.noreply.github.com"
-__version__ = "1.0.1"
+__version__ = "1.0.2"
