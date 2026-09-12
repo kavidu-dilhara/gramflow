@@ -52,6 +52,31 @@ class GramFlow(Client):
             parse_mode=ParseMode.HTML,
             sleep_threshold=int(get_config("GF_TG_ST", 10)),
             workers=int(get_config("GF_TG_WS", 10)),
+            # NOTE (item 12 - concurrency audit): `max_concurrent_transmissions`
+            # is a REAL pyrogram/kurigram setting - it bounds how many
+            # concurrent network transmissions the client's own
+            # connection pool will run. However, GramFlow's own
+            # upload_dir_contents() in upload.py processes files
+            # strictly sequentially (a plain `for` loop with `await`
+            # on every iteration, no asyncio.gather()), so at the
+            # GramFlow level there is never more than one file's
+            # reply_video/reply_document/reply_photo call in flight at
+            # a time. This setting therefore only affects the internal
+            # chunking of a SINGLE large file's upload (pyrogram can
+            # transmit multiple parts of one big file concurrently up
+            # to this limit) - it does NOT make GramFlow upload
+            # multiple different files at once. File-to-file uploads
+            # are intentionally sequential: the existing resume-state
+            # bookkeeping (state.py), the 10s post-upload rate-limit
+            # pause, and the single shared batch-progress status
+            # message are all written assuming one file completes
+            # (and is recorded) before the next one starts. Making
+            # file-to-file uploads concurrent would require bounding
+            # concurrency, making UploadState writes safe under
+            # concurrent access, and reworking the rate-limit pause -
+            # a larger, separate change, not attempted here per the
+            # audit's explicit instruction not to blindly add
+            # concurrency.
             max_concurrent_transmissions=int(get_config("GF_TG_MCTS", 4)),
             no_updates=True,
             device_model="Samsung SM-G998B",
@@ -93,11 +118,22 @@ class GramFlow(Client):
 
     async def start(self):
         await super().start()
-        print(
-            f"{self.me} based on Kurigram (pyrogram) v{__version__} started."
-        )
+        # SECURITY/PRIVACY HARDENING (items 14/17): previously printed
+        # the full `self.me` object - a verbose JSON-like dump
+        # including the account's numeric id, username, phone-linked
+        # flags, and other account metadata. This is not a credential
+        # (no api_hash/session token is in it), so it is not a
+        # "secret" under item 7/17's definition, but it is
+        # unnecessary account-identifying information to leave sitting
+        # in terminal scrollback or copy-pasted into a support/bug
+        # report verbatim - which is exactly how it showed up in a
+        # real user-submitted log during this project's development.
+        # A short, non-identifying confirmation is enough for the
+        # CLI's purposes.
+        name = getattr(self.me, "first_name", None) or "account"
+        print(f"Connected as {name} (Kurigram/pyrogram v{__version__}).")
 
     async def stop(self, *args):
-        usr_bot_me = self.me
+        name = getattr(self.me, "first_name", None) or "account"
         await super().stop()
-        print(f"{usr_bot_me} stopped. Bye.")
+        print(f"Disconnected ({name}). Bye.")
