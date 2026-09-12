@@ -152,6 +152,12 @@ Telegram's own Terms of Service for user accounts, so keep usage reasonable
 - **`FLOOD_WAIT_X` errors** — Telegram is rate-limiting your account; wait
   the number of seconds it reports before retrying. Sending very large
   batches back-to-back makes this more likely.
+- **Album upload fails** — GramFlow does not automatically retry a failed
+  media-group request as individual messages. This is intentional: after a
+  network timeout, Telegram may have accepted the album even if the client
+  did not receive the response, and an automatic fallback could duplicate
+  the files. The failed files are retained in resume state for an explicit
+  retry.
 - **No video thumbnail generated** — make sure `ffmpeg` is installed and on
   your `PATH`. Without it, uploads still work, just without a thumbnail.
 - **Asked for `api_id`/`api_hash` every run** — check that
@@ -172,7 +178,7 @@ Issues and pull requests are welcome at
 
 ## License
 
- MIT License — see [LICENSE](LICENSE). GramFlow is a fork of
+MIT License — see [LICENSE](LICENSE). GramFlow is a fork of
 `uploadgram`; original copyright is preserved in file headers alongside the
 new copyright for this fork.
 
