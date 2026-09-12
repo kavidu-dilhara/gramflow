@@ -12,31 +12,63 @@ jobs:
   pypi_release:
     name: Builds Using Poetry and Publishes to PyPI
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-python@v2
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # pyproject.toml requires python = ">=3.10,<4"
+          python-version: "3.12"
+
       - name: Install Poetry
         uses: snok/install-poetry@v1
+
       - name: Get Poetry version
         run: poetry --version
+
       - name: Check pyproject.toml validity
         run: |
           poetry lock
           poetry check --no-interaction
+
       - name: Setup package
         run: poetry install --no-interaction
-      - run: poetry config pypi-token.pypi "${{ secrets.PYPI_TOKEN }}"
+
+      - name: Configure PyPI token
+        run: poetry config pypi-token.pypi "${{ secrets.PYPI_TOKEN }}"
+
       - name: Publish package
         run: poetry publish --build
+
+      # Generate GitHub's built-in release notes
+      - name: Generate release notes
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            --method POST \
+            "/repos/${{ github.repository }}/releases/generate-notes" \
+            -f tag_name="${{ github.event.release.tag_name }}" \
+            > release-notes.json
+
+      # Update the published GitHub Release with the generated notes
+      - name: Update release notes
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY=$(jq -r '.body' release-notes.json)
+
+          gh api \
+            --method PATCH \
+            "/repos/${{ github.repository }}/releases/${{ github.event.release.id }}" \
+            -f body="$BODY"
+
       - name: Upload build artifacts to GitHub Release
-        # Only runs when this workflow was triggered by an actual
-        # GitHub release being published - `workflow_dispatch` runs
-        # have no release to attach files to, so this step is skipped
-        # (not failed) on that trigger.
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          # `poetry publish --build` leaves the built .tar.gz and .whl
-          # in dist/ - globbing here means this never needs a manual
-          # edit when the version number changes.
+          # Poetry creates the .tar.gz and .whl files in dist/
           files: dist/*
