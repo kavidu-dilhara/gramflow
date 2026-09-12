@@ -24,6 +24,19 @@ from time import time
 from .humanbytes import humanbytes
 from .time_formatter import time_formatter
 
+# BUG FIX (item 8 - progress update throttling): previously throttled
+# with `int(diff) % 10 == 0`, where `diff` is the time elapsed since
+# the transfer *started* - not since the last update. Multiple
+# progress callbacks landing within the same integer second (common
+# for fast transfers/small chunks) could all satisfy that check and
+# each trigger a separate Telegram message edit for the same instant.
+# A real last-update timestamp, keyed per Message so concurrent
+# uploads/progress messages don't share state, fixes this: an edit
+# only happens once at least PROGRESS_UPDATE_INTERVAL seconds have
+# actually passed since the previous edit for THAT message.
+PROGRESS_UPDATE_INTERVAL = 10  # seconds
+_last_update_by_message: "dict[int, float]" = {}
+
 
 async def progress_for_pyrogram(
     current: int,
@@ -51,49 +64,63 @@ async def progress_for_pyrogram(
         if current >= total:
             pbar.set_description("uploaded")
     else:
-        # BUG FIX: was `round(diff % 10.00) == 0 or current == total`,
-        # which also evaluated True for small fractional remainders
-        # (e.g. round(0.04) == 0), causing an immediate edit on the
-        # first callback. Use the integer-second 10-second boundary
-        # instead so we edit roughly once every 10 s, plus always on
-        # the final callback.
-        if (int(diff) > 0 and int(diff) % 10 == 0) or current == total:
-            try:
-                percentage = current * 100 / total
-            except ZeroDivisionError:
-                percentage = 0
-            elapsed_time = round(diff)
-            if elapsed_time == 0:
-                return
-            speed = current / elapsed_time
-            time_to_completion = round((total - current) / speed) if speed else 0
-            estimated_total_time = elapsed_time + time_to_completion
+        is_final = current >= total
+        # BUG FIX (item 8): key last-update time by the target
+        # Message's id, not a single module-level scalar, so two
+        # uploads progressing concurrently (e.g. if this project ever
+        # adds bounded concurrency) don't stomp on each other's
+        # throttling state and both still get their own periodic
+        # updates and their own guaranteed final update.
+        msg_key = getattr(message, "id", id(message))
+        last_update = _last_update_by_message.get(msg_key, 0.0)
+        # BUG FIX: the final 100% update must always be sent
+        # regardless of the interval, so the status message never
+        # gets stuck showing a stale in-progress percentage.
+        if not is_final and (now - last_update) < PROGRESS_UPDATE_INTERVAL:
+            return
+        _last_update_by_message[msg_key] = now
+        if is_final:
+            # Done with this message's progress reporting - drop its
+            # throttling entry so `_last_update_by_message` doesn't
+            # grow forever across a long batch of many files.
+            _last_update_by_message.pop(msg_key, None)
 
-            elapsed_time = time_formatter(elapsed_time)
-            estimated_total_time = time_formatter(estimated_total_time)
+        try:
+            percentage = current * 100 / total
+        except ZeroDivisionError:
+            percentage = 0
+        elapsed_time = round(diff)
+        if elapsed_time == 0:
+            return
+        speed = current / elapsed_time
+        time_to_completion = round((total - current) / speed) if speed else 0
+        estimated_total_time = elapsed_time + time_to_completion
 
-            progress = "[{0}{1}] \nP: {2}%\n".format(
-                "".join(["\u25AC" for _ in range(math.floor(percentage / 5))]),
-                "".join(["\u2591" for _ in range(20 - math.floor(percentage / 5))]),
-                round(percentage, 2),
-            )
+        elapsed_time = time_formatter(elapsed_time)
+        estimated_total_time = time_formatter(estimated_total_time)
 
-            tmp = progress + "{0} of {1}\nSpeed: {2}/s\nETA: {3}\n".format(
-                humanbytes(current),
-                humanbytes(total),
-                humanbytes(speed),
-                estimated_total_time
-                if estimated_total_time != ""
-                else "0 seconds",
-            )
-            try:
-                await message.edit_text(text=f"{ud_type}\n {tmp}")
-            except FloodWait as e:
-                await sleep(e.value)
-            except MessageNotModified:
-                # BUG FIX: the previous bare `except:` swallowed
-                # everything, including Ctrl+C (KeyboardInterrupt) and
-                # asyncio.CancelledError, since those subclass
-                # BaseException, not Exception. Only the genuinely
-                # expected "nothing changed" case is ignored now.
-                pass
+        progress = "[{0}{1}] \nP: {2}%\n".format(
+            "".join(["\u25AC" for _ in range(math.floor(percentage / 5))]),
+            "".join(["\u2591" for _ in range(20 - math.floor(percentage / 5))]),
+            round(percentage, 2),
+        )
+
+        tmp = progress + "{0} of {1}\nSpeed: {2}/s\nETA: {3}\n".format(
+            humanbytes(current),
+            humanbytes(total),
+            humanbytes(speed),
+            estimated_total_time
+            if estimated_total_time != ""
+            else "0 seconds",
+        )
+        try:
+            await message.edit_text(text=f"{ud_type}\n {tmp}")
+        except FloodWait as e:
+            await sleep(e.value)
+        except MessageNotModified:
+            # BUG FIX: the previous bare `except:` swallowed
+            # everything, including Ctrl+C (KeyboardInterrupt) and
+            # asyncio.CancelledError, since those subclass
+            # BaseException, not Exception. Only the genuinely
+            # expected "nothing changed" case is ignored now.
+            pass
