@@ -103,8 +103,10 @@ async def upload(
 
     print(
         f"[GramFlow] Batch finished: {batch_progress.done_files} uploaded, "
-        f"{batch_progress.skipped_files} skipped, "
-        f"{batch_progress.failed_files} failed"
+        f"{batch_progress.skipped_files} skipped (resumed), "
+        f"{batch_progress.oversized_files} skipped (too large), "
+        f"{batch_progress.failed_files} failed "
+        f"(total {batch_progress.total_files})"
     )
 
     try:
@@ -242,8 +244,10 @@ async def do_logout():
         return
     client = GramFlow()
     revoked = False
+    started = False
     try:
         await client.start()
+        started = True
         # BUG-SAFE: log_out() tells Telegram's servers to invalidate
         # this session (so it can no longer be used even if the local
         # file were somehow copied elsewhere). If this fails (e.g. no
@@ -255,6 +259,28 @@ async def do_logout():
     except Exception as e:
         print(f"[warn] could not reach Telegram to revoke the session: {e!r}")
     finally:
+        # BUG FIX (item 4 - logout client cleanup): previously there
+        # was no client.stop() call anywhere in this function. If
+        # client.start() succeeded but log_out() then raised (network
+        # drop mid-call, unexpected server error, etc.) the client was
+        # left connected with its background network tasks still
+        # running for the rest of the process's lifetime - a real
+        # resource leak, distinct from the local session *file*
+        # cleanup below.
+        #
+        # NOTE: on a *successful* log_out(), pyrogram/kurigram already
+        # stops the client internally as part of invalidating the
+        # session - calling stop() again would raise "client is
+        # already terminated". Rather than depend on that internal
+        # behaviour staying the same across kurigram versions, the
+        # stop() call itself is wrapped so an "already stopped" error
+        # here is treated the same as any other already-shutting-down
+        # condition: harmless, and not reported to the user.
+        if started:
+            try:
+                await client.stop()
+            except Exception:  # noqa: BLE001 - already shutting down
+                pass
         # log_out() already deletes pyrogram's own session file on
         # success; guard against it not existing any more before we
         # try to remove it ourselves, and never let a missing file be
